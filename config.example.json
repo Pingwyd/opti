@@ -1,0 +1,10 @@
+{
+  "provider": "gemini",
+  "api_key": "",
+  "hotkey": "ctrl+shift+space",
+  "model": "gemini-3.5-flash",
+  "model_fast": "gemini-3.1-flash-lite",
+  "mode": "thorough",
+  "history_limit": 50,
+  "start_with_windows": false
+}

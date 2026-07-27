@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MetaPrompt</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Borderless shell — only inner dialogs carry visual chrome -->
+  <div id="app" class="shell" data-state="main">
+    <!-- API key setup dialog -->
+    <section
+      id="setup"
+      class="dialog dialog--setup hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="setup-title"
+      aria-describedby="setup-desc"
+    >
+      <div class="dialog__drag-bar" aria-hidden="true" title="Drag to move"></div>
+      <header class="dialog__header dialog__header--setup">
+        <div class="dialog__mark" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+            <path
+              d="M12 2.5l1.4 4.9 4.9 1.4-4.9 1.4L12 15.1l-1.4-4.9-4.9-1.4 4.9-1.4L12 2.5z"
+              fill="currentColor"
+            />
+          </svg>
+        </div>
+        <div>
+          <h1 id="setup-title" class="dialog__title">Connect your API key</h1>
+          <p id="setup-desc" class="dialog__subtitle">
+            Gemini is the default (free tier). Your key stays on this device and is only sent to your chosen provider.
+          </p>
+        </div>
+      </header>
+
+      <div class="field">
+        <label class="field__label" for="api-key-input">API key</label>
+        <input
+          id="api-key-input"
+          type="password"
+          class="field__input field__input--key"
+          placeholder="Paste key here"
+          autocomplete="off"
+          spellcheck="false"
+          aria-required="true"
+        />
+      </div>
+
+      <p id="setup-error" class="dialog__error hidden" role="alert"></p>
+
+      <div class="dialog__actions">
+        <button id="save-key-btn" type="button" class="btn btn--primary">
+          Save and continue
+        </button>
+      </div>
+    </section>
+
+    <!-- Main prompt dialog -->
+    <section
+      id="main"
+      class="dialog dialog--main"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="prompt-label"
+    >
+      <div class="input-bar" id="bar">
+        <div class="input-bar__icon" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <path
+              d="M12 3l1.1 3.8L17 7.7l-3.9 1.1L12 12.6 10.9 8.8 7 7.7l3.9-1.1L12 3z"
+              fill="currentColor"
+            />
+            <path
+              d="M5.5 15.5l.6 2 2 .6-2 .6-.6 2-.6-2-2-.6 2-.6.6-2z"
+              fill="currentColor"
+              opacity="0.6"
+            />
+          </svg>
+        </div>
+
+        <label id="prompt-label" class="visually-hidden" for="prompt-input">
+          Rough prompt to optimize
+        </label>
+        <textarea
+          id="prompt-input"
+          class="input-bar__input"
+          rows="1"
+          placeholder="What do you want to ask an AI?"
+          autocomplete="off"
+          spellcheck="true"
+          aria-describedby="main-hint"
+        ></textarea>
+
+        <div id="status" class="input-bar__status" aria-live="polite" aria-atomic="true">
+          <span id="spinner" class="spinner hidden" aria-hidden="true"></span>
+          <button
+            id="mode-badge"
+            type="button"
+            class="mode-badge"
+            aria-label="Optimization mode: thorough. Click to switch to fast."
+          >
+            thorough
+          </button>
+        </div>
+      </div>
+
+      <div id="result-panel" class="result hidden" aria-live="polite">
+        <div class="result__head">
+          <span class="result__label">Optimized prompt</span>
+          <span id="copied-hint" class="result__copied" aria-live="polite">Copied to clipboard</span>
+        </div>
+
+        <label class="visually-hidden" for="result-text">Optimized prompt output</label>
+        <textarea
+          id="result-text"
+          class="result__body"
+          readonly
+          spellcheck="false"
+          aria-label="Optimized prompt — editable after focus"
+        ></textarea>
+
+        <p id="error-text" class="dialog__error hidden" role="alert"></p>
+
+        <footer class="result__foot">
+          <p id="main-hint" class="result__hint">
+            <kbd>Enter</kbd> optimize · <kbd>Esc</kbd> close · click outside to dismiss
+          </p>
+          <button id="copy-btn" type="button" class="btn btn--ghost">Copy again</button>
+        </footer>
+      </div>
+    </section>
+  </div>
+  <script src="script.js"></script>
+</body>
+</html>

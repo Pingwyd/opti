@@ -1,0 +1,9 @@
+google-genai>=1.0.0
+openai>=1.40.0
+anthropic>=0.40.0
+PyQt6>=6.6
+pystray>=0.19.5
+pynput>=1.7.6
+pyperclip>=1.8.2
+Pillow>=10.0.0
+pytest>=8.0

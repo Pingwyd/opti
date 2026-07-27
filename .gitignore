@@ -1,0 +1,26 @@
+﻿# Local MetaPrompt settings — do not commit real API keys.
+config.json
+
+# Local user data
+history.json
+draft.json
+
+# Logs and env
+logs/
+*.log
+.env
+
+# Virtualenv and Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.Python
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
