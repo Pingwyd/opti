@@ -10,6 +10,11 @@ logs/
 *.log
 .env
 
+# Build output
+build/
+dist/
+packaging/Output/
+
 # Virtualenv and Python
 .venv/
 venv/

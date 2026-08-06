@@ -2,7 +2,9 @@
 ; Requires PyInstaller output in dist\Opti\
 
 #define MyAppName "Opti"
-#define MyAppVersion "1.0.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.0"
+#endif
 #define MyAppPublisher "Pingwyd"
 #define MyAppURL "https://github.com/Pingwyd/opti"
 #define MyAppExeName "Opti.exe"
@@ -31,7 +33,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\dist\Opti\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; portable.txt must never ship in the installer: it switches the app to
+; portable mode and makes it write config next to the exe.
+Source: "..\dist\Opti\*"; DestDir: "{app}"; Excludes: "portable.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
