@@ -19,7 +19,8 @@ from paths import get_data_dir
 
 HISTORY_PATH = get_data_dir() / "history.json"
 
-_DEFAULT_SENSITIVE_KEYWORDS = ("password", "secret", "api_key", "api key", "token", "credential")
+DEFAULT_SENSITIVE_KEYWORDS = ("password", "secret", "api_key", "api key", "token", "credential")
+_DEFAULT_SENSITIVE_KEYWORDS = DEFAULT_SENSITIVE_KEYWORDS  # legacy alias
 
 
 def _read_all() -> list[dict[str, Any]]:
@@ -229,6 +230,29 @@ def distinct_project_names() -> list[str]:
         if name:
             names.add(name)
     return sorted(names, key=str.lower)
+
+
+def count_by_project_name(name: str) -> int:
+    """Number of history entries tagged with the given project name."""
+    target = (name or "").strip().lower()
+    if not target:
+        return 0
+    return sum(
+        1
+        for entry in get_entries()
+        if str(entry.get("project_name") or "").strip().lower() == target
+    )
+
+
+def counts_by_project_name() -> dict[str, int]:
+    """Batch version of count_by_project_name for populating a project list."""
+    counts: dict[str, int] = {}
+    for entry in get_entries():
+        name = str(entry.get("project_name") or "").strip()
+        if not name:
+            continue
+        counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
 def history_file_path() -> Path:

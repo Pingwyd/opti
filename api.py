@@ -7,6 +7,7 @@ only — never exposed to the popup UI or external scripts.
 
 from __future__ import annotations
 
+import math
 import random
 import re
 import time
@@ -31,6 +32,12 @@ _BASE_RETRY_DELAY_SECONDS = 1.0
 _MAX_RETRY_DELAY_SECONDS = 30.0
 
 _RETRYABLE_STATUS_CODES = {429, 502, 503, 504, 529}
+
+# Granularity for should_cancel polling during a retry delay. Expressed as a
+# fixed count of intended increments (not measured via wall-clock elapsed
+# time) so the loop terminates deterministically regardless of what
+# time.sleep actually does — a no-op time.sleep (as in tests) must not spin.
+_CANCEL_POLL_INTERVAL_SECONDS = 0.1
 
 _RETRYABLE_MESSAGE_PATTERNS = (
     r"rate\s*limit",
@@ -148,6 +155,7 @@ def optimize_prompt_with_retry(
     *,
     private_mode: bool = False,
     on_retry: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str:
     """
     Call optimize_prompt with exponential backoff for transient API failures.
@@ -155,10 +163,14 @@ def optimize_prompt_with_retry(
     last_exc: BaseException | None = None
 
     for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
+        if should_cancel and should_cancel():
+            raise RuntimeError("Cancelled")
         try:
             return optimize_prompt(rough_prompt, model=model, private_mode=private_mode)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+            if should_cancel and should_cancel():
+                raise RuntimeError("Cancelled") from exc
             if not is_retryable_error(exc) or attempt >= _MAX_RETRY_ATTEMPTS:
                 if is_retryable_error(exc) and attempt >= _MAX_RETRY_ATTEMPTS:
                     raise RuntimeError(_MAX_RETRIES_EXCEEDED_MESSAGE) from exc
@@ -167,7 +179,19 @@ def optimize_prompt_with_retry(
             if on_retry is not None:
                 on_retry(attempt + 1, _MAX_RETRY_ATTEMPTS)
 
-            time.sleep(_retry_delay_seconds(exc, attempt))
+            delay = _retry_delay_seconds(exc, attempt)
+            if should_cancel is None:
+                time.sleep(delay)
+            else:
+                remaining = delay
+                poll = _CANCEL_POLL_INTERVAL_SECONDS
+                iterations = max(1, math.ceil(delay / poll))
+                for _ in range(iterations):
+                    if should_cancel():
+                        raise RuntimeError("Cancelled") from exc
+                    chunk = min(poll, remaining)
+                    time.sleep(chunk)
+                    remaining -= chunk
 
     if last_exc is not None:
         if is_retryable_error(last_exc):

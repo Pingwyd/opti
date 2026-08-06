@@ -68,6 +68,32 @@ def test_can_inject_target_requires_valid_non_blocked():
             )
             is False
         )
+        assert (
+            inject.can_inject_target(
+                {"hwnd": 99, "title": "Opti", "process_name": "python.exe"},
+                own_hwnd=99,
+            )
+            is False
+        )
+
+
+def test_record_foreground_target_skips_self_process():
+    with patch("inject.is_windows", return_value=True):
+        mock_gui = MagicMock()
+        mock_gui.GetForegroundWindow.return_value = 100
+        mock_gui.GetWindowText.return_value = "Opti"
+        with patch.dict("sys.modules", {"win32gui": mock_gui}):
+            with patch("inject._process_name_for_hwnd", return_value="python.exe"):
+                assert inject.record_foreground_target() == {}
+
+
+@patch("inject.is_windows", return_value=True)
+def test_record_foreground_target_skips_excluded_hwnd(_is_windows):
+    mock_gui = MagicMock()
+    mock_gui.GetForegroundWindow.return_value = 77
+    with patch.dict("sys.modules", {"win32gui": mock_gui}):
+        assert inject.record_foreground_target(exclude_hwnds={77}) == {}
+        mock_gui.GetWindowText.assert_not_called()
 
 
 @patch("inject.is_windows", return_value=False)
@@ -91,6 +117,20 @@ def test_inject_via_paste_noop_off_windows(_is_windows):
     ok, message = inject.inject_via_paste(1, "hello")
     assert ok is False
     assert "Windows" in message
+
+
+@patch("inject.is_windows", return_value=True)
+def test_force_foreground_uses_win32process_attach(_is_windows):
+    mock_gui = MagicMock()
+    mock_gui.GetForegroundWindow.side_effect = [999, 42, 42]
+    mock_gui.IsIconic.return_value = False
+    mock_process = MagicMock()
+    mock_process.GetWindowThreadProcessId.side_effect = [(1, 10), (2, 20)]
+    mock_process.AttachThreadInput = MagicMock()
+    with patch.dict("sys.modules", {"win32gui": mock_gui, "win32process": mock_process, "win32con": MagicMock()}):
+        assert inject._force_foreground(42) is True
+    mock_process.AttachThreadInput.assert_any_call(1, 2, True)
+    mock_process.AttachThreadInput.assert_any_call(1, 2, False)
 
 
 def test_auto_inject_config_defaults(isolated_config):

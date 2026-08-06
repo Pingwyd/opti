@@ -83,14 +83,16 @@ def _normalize_project(project: dict[str, Any]) -> dict[str, Any]:
     if project_type not in PROJECT_TYPES:
         project_type = ""
 
+    created = str(project.get("created") or _utc_now_iso())
     return {
         "name": str(project.get("name") or "").strip(),
         "tech_stack": tech_stack,
         "project_type": project_type,
         "conventions": str(project.get("conventions") or "").strip(),
         "notes": str(project.get("notes") or "").strip(),
-        "created": str(project.get("created") or _utc_now_iso()),
-        "last_used": str(project.get("last_used") or _utc_now_iso()),
+        "created": created,
+        "last_used": str(project.get("last_used") or created),
+        "updated": str(project.get("updated") or created),
     }
 
 
@@ -154,6 +156,7 @@ def create_project(
         "notes": (notes or "").strip(),
         "created": now,
         "last_used": now,
+        "updated": now,
     }
     cfg["projects"] = projects
     save_config(cfg)
@@ -183,14 +186,16 @@ def update_project(
     if ptype not in PROJECT_TYPES:
         ptype = ""
 
+    created = str(existing.get("created") or _utc_now_iso())
     projects[project_id] = {
         "name": display_name,
         "tech_stack": [t.strip() for t in (tech_stack or []) if t.strip()],
         "project_type": ptype,
         "conventions": (conventions or "").strip(),
         "notes": (notes or "").strip(),
-        "created": str(existing.get("created") or _utc_now_iso()),
-        "last_used": str(existing.get("last_used") or _utc_now_iso()),
+        "created": created,
+        "last_used": str(existing.get("last_used") or created),
+        "updated": _utc_now_iso(),
     }
     cfg["projects"] = projects
     save_config(cfg)
