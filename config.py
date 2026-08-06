@@ -1,5 +1,5 @@
 """
-Load and save MetaPrompt settings from config.json next to this package.
+Load and save Opti settings from config.json in the user data directory.
 
 API keys are never logged — callers should treat get_api_key() as sensitive.
 
@@ -16,9 +16,11 @@ from typing import Any
 
 import secrets
 
-# Directory containing this file (metaprompt/)
-APP_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = APP_DIR / "config.json"
+from paths import BUNDLE_DIR, ensure_data_dir, get_data_dir
+
+# Legacy alias — bundle/source root (not always writable when frozen)
+APP_DIR = BUNDLE_DIR
+CONFIG_PATH = get_data_dir() / "config.json"
 
 # Per-provider defaults (models tuned for personal / free-tier use where possible)
 PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
@@ -58,6 +60,10 @@ DEFAULT_SHORTCUT_COLLAPSE = "Ctrl+Shift+M"
 DEFAULT_SHORTCUT_HIDE_TRAY = "Escape"
 DEFAULT_SHORTCUT_PRIVATE = "Ctrl+Shift+P"
 RESCUE_WINDOW_SHORTCUT = "Ctrl+Shift+R"
+DEFAULT_VOICE_PTT_SHORTCUT = "Ctrl+Space"
+VALID_VOICE_MODEL_SIZES = ("tiny", "base", "small", "medium")
+VALID_VOICE_TRANSCRIPTION_MODES = ("local", "cloud")
+VALID_VOICE_RECORDING_MODES = ("push_to_talk", "toggle")
 
 # Defaults: Gemini free tier (Flash), not a paid Pro model
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -74,6 +80,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "exclude_sensitive": False,
     "exclude_sensitive_keywords": [],
     "start_with_windows": False,
+    "start_minimized_to_tray": True,
+    "check_updates_on_launch": False,
     "persist_draft": True,
     "pill_collapsed": False,
     "window_x": None,
@@ -84,9 +92,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "shortcut_hide_tray": DEFAULT_SHORTCUT_HIDE_TRAY,
     "shortcut_private": DEFAULT_SHORTCUT_PRIVATE,
     "auto_copy_clipboard": True,
+    "auto_inject_enabled": False,
     "projects": {},
     "active_project": None,
     "include_project_context_in_private": False,
+    "voice_enabled": False,
+    "voice_transcription_mode": "local",
+    "voice_recording_mode": "push_to_talk",
+    "voice_model_size": "base",
+    "voice_toggle_max_seconds": 60,
+    "voice_ptt_shortcut": DEFAULT_VOICE_PTT_SHORTCUT,
 }
 
 # Migrate legacy model IDs (Claude defaults, Gemini 2.5, old OpenRouter slugs)
@@ -111,8 +126,13 @@ _LEGACY_MODEL_MAP = {
 
 def _ensure_config_file() -> None:
     """Create config.json with defaults if it does not exist."""
+    ensure_data_dir()
     if not CONFIG_PATH.exists():
-        save_config(deepcopy(DEFAULT_CONFIG))
+        example = BUNDLE_DIR / "config.example.json"
+        if example.is_file():
+            CONFIG_PATH.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            save_config(deepcopy(DEFAULT_CONFIG))
 
 
 def load_config() -> dict[str, Any]:
@@ -678,6 +698,14 @@ def set_shortcut_private(shortcut: str) -> None:
     save_config(cfg)
 
 
+def get_start_minimized_to_tray() -> bool:
+    return bool(load_config().get("start_minimized_to_tray", True))
+
+
+def get_check_updates_on_launch() -> bool:
+    return bool(load_config().get("check_updates_on_launch", False))
+
+
 def get_auto_copy_clipboard() -> bool:
     return bool(load_config().get("auto_copy_clipboard", True))
 
@@ -686,3 +714,65 @@ def set_auto_copy_clipboard(enabled: bool) -> None:
     cfg = load_config()
     cfg["auto_copy_clipboard"] = bool(enabled)
     save_config(cfg)
+
+
+def get_auto_inject_enabled() -> bool:
+    return bool(load_config().get("auto_inject_enabled", False))
+
+
+def set_auto_inject_enabled(enabled: bool) -> None:
+    cfg = load_config()
+    cfg["auto_inject_enabled"] = bool(enabled)
+    save_config(cfg)
+
+
+def _normalize_voice_model_size(size: str) -> str:
+    normalized = str(size or "base").lower().strip()
+    return normalized if normalized in VALID_VOICE_MODEL_SIZES else "base"
+
+
+def _normalize_voice_transcription_mode(mode: str) -> str:
+    normalized = str(mode or "local").lower().strip()
+    return normalized if normalized in VALID_VOICE_TRANSCRIPTION_MODES else "local"
+
+
+def _normalize_voice_recording_mode(mode: str) -> str:
+    normalized = str(mode or "push_to_talk").lower().strip()
+    return normalized if normalized in VALID_VOICE_RECORDING_MODES else "push_to_talk"
+
+
+def get_voice_enabled() -> bool:
+    return bool(load_config().get("voice_enabled", False))
+
+
+def get_voice_transcription_mode(*, private_mode: bool = False) -> str:
+    if private_mode:
+        return "local"
+    return _normalize_voice_transcription_mode(
+        str(load_config().get("voice_transcription_mode") or "local")
+    )
+
+
+def get_voice_recording_mode() -> str:
+    return _normalize_voice_recording_mode(
+        str(load_config().get("voice_recording_mode") or "push_to_talk")
+    )
+
+
+def get_voice_model_size() -> str:
+    return _normalize_voice_model_size(str(load_config().get("voice_model_size") or "base"))
+
+
+def get_voice_toggle_max_seconds() -> int:
+    try:
+        value = int(load_config().get("voice_toggle_max_seconds") or 60)
+    except (TypeError, ValueError):
+        value = 60
+    return max(5, min(600, value))
+
+
+def get_voice_ptt_shortcut() -> str:
+    return normalize_shortcut_string(
+        str(load_config().get("voice_ptt_shortcut") or ""),
+        DEFAULT_VOICE_PTT_SHORTCUT,
+    )

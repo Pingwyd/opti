@@ -1,5 +1,5 @@
 """
-MetaPrompt — Windows tray app entry point.
+Opti — Windows tray app entry point.
 
 Starts:
   - QApplication (PyQt6) on the main thread
@@ -30,7 +30,14 @@ if str(APP_DIR) not in sys.path:
 from PyQt6.QtCore import QTimer  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
-from config import get_hotkey, get_hotkey_collapse, has_api_key  # noqa: E402
+from brand import APP_NAME, APP_VERSION, TRAY_TOOLTIP  # noqa: E402
+from config import (  # noqa: E402
+    get_check_updates_on_launch,
+    get_hotkey,
+    get_hotkey_collapse,
+    get_start_minimized_to_tray,
+    has_api_key,
+)
 from hotkey_service import GlobalHotkeyService  # noqa: E402
 from log_config import setup_logging  # noqa: E402
 from popup import controller  # noqa: E402
@@ -91,7 +98,7 @@ def start_tray(on_quit, icon_holder: dict[str, Any]) -> None:
         on_quit()
 
     menu = pystray.Menu(
-        Item("Open MetaPrompt", show_popup, default=True),
+        Item(f"Open {APP_NAME}", show_popup, default=True),
         Item("Reset window position", reset_window_position),
         Item("Open history", open_history),
         Item("Settings", open_settings),
@@ -105,9 +112,9 @@ def start_tray(on_quit, icon_holder: dict[str, Any]) -> None:
     )
 
     icon = pystray.Icon(
-        "MetaPrompt",
+        APP_NAME,
         make_tray_icon_image(),
-        "MetaPrompt",
+        TRAY_TOOLTIP,
         menu,
     )
     icon_holder["icon"] = icon
@@ -119,8 +126,8 @@ def start_tray(on_quit, icon_holder: dict[str, Any]) -> None:
 
 def _global_hotkey_bindings() -> dict[str, Any]:
     return {
-        get_hotkey(): controller.toggle,
-        get_hotkey_collapse(): controller.toggle_collapse_global,
+        get_hotkey(): controller.toggle_from_hotkey,
+        get_hotkey_collapse(): controller.toggle_collapse_global_from_hotkey,
     }
 
 
@@ -157,7 +164,8 @@ def main() -> None:
     setup_logging()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    app.setApplicationName("MetaPrompt")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
 
     apply_start_with_windows_from_config()
 
@@ -229,7 +237,7 @@ def main() -> None:
     tray_thread = threading.Thread(
         target=start_tray,
         args=(request_quit, _tray_icon),
-        name="MetaPromptTray",
+        name="OptiTray",
         daemon=True,
     )
     tray_thread.start()
@@ -240,6 +248,13 @@ def main() -> None:
 
     # Create popup and run Qt event loop on the main thread (required on Windows)
     controller.create_window()
+
+    if get_check_updates_on_launch():
+        log.debug("Update check on launch is enabled (stub — not implemented)")
+
+    if not get_start_minimized_to_tray():
+        controller.show_expanded()
+
     sys.exit(app.exec())
 
 

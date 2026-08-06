@@ -12,11 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from config import APP_DIR, load_config
+from config import load_config
+from paths import get_data_dir
 
 log = logging.getLogger(__name__)
 
-DRAFT_PATH = APP_DIR / "draft.json"
+DRAFT_PATH = get_data_dir() / "draft.json"
 
 
 def _persist_enabled() -> bool:

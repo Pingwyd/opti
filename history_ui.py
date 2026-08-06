@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QKeyEvent
+from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -39,22 +39,23 @@ from ui_theme import DESIGN_TOKENS, history_stylesheet
 _C = DESIGN_TOKENS["color"]
 
 PAGE_SIZE = 25
-PREVIEW_CHARS = 80
 SEARCH_DEBOUNCE_MS = 300
 
 _DATE_RANGE_OPTIONS = (
     ("All", None),
-    ("7 days", 7),
-    ("30 days", 30),
-    ("90 days", 90),
+    ("7d", 7),
+    ("30d", 30),
+    ("90d", 90),
 )
 
-
-def _preview(text: str, max_len: int = PREVIEW_CHARS) -> str:
-    one_line = " ".join((text or "").split())
-    if len(one_line) <= max_len:
-        return one_line
-    return one_line[: max_len - 1] + "…"
+_PROJECT_TAG_COLORS: tuple[tuple[str, str, str], ...] = (
+    ("rgba(99, 102, 241, 0.18)", "rgba(99, 102, 241, 0.42)", "#a5b4fc"),
+    ("rgba(34, 197, 94, 0.15)", "rgba(34, 197, 94, 0.38)", "#86efac"),
+    ("rgba(56, 189, 248, 0.15)", "rgba(56, 189, 248, 0.38)", "#7dd3fc"),
+    ("rgba(251, 191, 36, 0.15)", "rgba(251, 191, 36, 0.38)", "#fcd34d"),
+    ("rgba(244, 114, 182, 0.15)", "rgba(244, 114, 182, 0.38)", "#f9a8d4"),
+    ("rgba(167, 139, 250, 0.15)", "rgba(167, 139, 250, 0.38)", "#c4b5fd"),
+)
 
 
 def _format_timestamp(ts: str) -> str:
@@ -67,6 +68,101 @@ def _format_timestamp(ts: str) -> str:
         parsed = parsed.replace(tzinfo=timezone.utc)
     local = parsed.astimezone()
     return local.strftime("%Y-%m-%d %H:%M")
+
+
+def _project_tag_colors(name: str) -> tuple[str, str, str]:
+    idx = sum(ord(c) for c in name.lower()) % len(_PROJECT_TAG_COLORS)
+    return _PROJECT_TAG_COLORS[idx]
+
+
+def _project_tag_stylesheet(name: str | None, *, selected: bool = False) -> str:
+    base = (
+        "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600;"
+    )
+    if not name:
+        if selected:
+            return (
+                f"{base} background: rgba(255, 255, 255, 0.10);"
+                f" color: {_C['text_muted']};"
+                f" border: 1px solid {_C['accent_border']};"
+            )
+        return (
+            f"{base} background: rgba(255, 255, 255, 0.04);"
+            f" color: {_C['text_muted']};"
+            f" border: 1px solid {_C['border_subtle']};"
+        )
+    if selected:
+        return (
+            f"{base} background: {_C['accent']};"
+            f" color: #1a1a1a;"
+            f" border: 1px solid {_C['accent']};"
+        )
+    bg, border, text = _project_tag_colors(name)
+    return f"{base} background: {bg}; color: {text}; border: 1px solid {border};"
+
+
+class _ProjectModelCell(QWidget):
+    """Stacked project tag pill and model name for a history table row."""
+
+    def __init__(
+        self,
+        project_name: str | None,
+        model: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("projectModelCell")
+        self._project_name = (project_name or "").strip() or None
+        self._selected = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(3)
+
+        self._tag = QLabel(self._project_name or "No project", self)
+        self._tag.setObjectName("projectTag")
+        self._tag.setSizePolicy(
+            self._tag.sizePolicy().horizontalPolicy(),
+            self._tag.sizePolicy().verticalPolicy(),
+        )
+        self._tag.setMaximumHeight(22)
+
+        self._model = QLabel(model or "—", self)
+        self._model.setObjectName("modelName")
+
+        layout.addWidget(self._tag, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self._model, alignment=Qt.AlignmentFlag.AlignLeft)
+        self._apply_styles()
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self._apply_styles()
+
+    def _apply_styles(self) -> None:
+        self._tag.setStyleSheet(_project_tag_stylesheet(self._project_name, selected=self._selected))
+        row_bg = "rgba(240, 128, 96, 0.14)" if self._selected else "transparent"
+        self.setStyleSheet(f"background: {row_bg};")
+
+
+class _StatusIconCell(QWidget):
+    """Small green checkmark indicating a completed optimization."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("statusIconCell")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 10, 0)
+        layout.setSpacing(0)
+        icon = QLabel("✓", self)
+        icon.setObjectName("statusCheck")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setAccessibleName("Optimized")
+        layout.addStretch()
+        layout.addWidget(icon)
+
+    def set_selected(self, selected: bool) -> None:
+        row_bg = "rgba(240, 128, 96, 0.14)" if selected else "transparent"
+        self.setStyleSheet(f"background: {row_bg};")
 
 
 class _FilterChip(QPushButton):
@@ -96,6 +192,7 @@ class HistoryDialog(QDialog):
         self._selected_entry: dict[str, Any] | None = None
         self._date_pill_buttons: list[QPushButton] = []
         self._project_filter: str | None = None
+        self._highlighted_row = -1
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -172,9 +269,12 @@ class HistoryDialog(QDialog):
 
         root.addWidget(search_wrap)
 
-        # --- Date range pills ---
-        pills_row = QHBoxLayout()
-        pills_row.setSpacing(6)
+        # --- Filters: date pills + project dropdown in one bar ---
+        filters_frame = QFrame(self)
+        filters_frame.setObjectName("filtersBar")
+        filters_layout = QHBoxLayout(filters_frame)
+        filters_layout.setContentsMargins(12, 8, 12, 8)
+        filters_layout.setSpacing(8)
 
         self._date_group = QButtonGroup(self)
         self._date_group.setExclusive(True)
@@ -187,35 +287,32 @@ class HistoryDialog(QDialog):
                 btn.setChecked(True)
             self._date_group.addButton(btn, index)
             self._date_pill_buttons.append(btn)
-            pills_row.addWidget(btn)
-        pills_row.addStretch()
+            filters_layout.addWidget(btn)
         self._date_group.idClicked.connect(self._on_date_pill_clicked)
-        root.addLayout(pills_row)
 
-        project_row = QHBoxLayout()
-        project_row.setSpacing(8)
-        project_label = QLabel("Project:", self)
-        project_label.setObjectName("chipsLabel")
-        project_row.addWidget(project_label)
-        self._project_combo = QComboBox(self)
+        separator = QFrame(filters_frame)
+        separator.setObjectName("filterSeparator")
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFixedWidth(1)
+        filters_layout.addWidget(separator)
+
+        self._project_combo = QComboBox(filters_frame)
         self._project_combo.setObjectName("historyProjectFilter")
         self._project_combo.setMinimumHeight(32)
+        self._project_combo.setMinimumWidth(160)
         self._project_combo.currentIndexChanged.connect(self._on_project_filter_changed)
-        project_row.addWidget(self._project_combo, stretch=1)
-        project_row.addStretch()
-        root.addLayout(project_row)
+        filters_layout.addWidget(self._project_combo, stretch=1)
+
+        root.addWidget(filters_frame)
 
         self._reload_project_filter_options()
 
-        # --- Active filter chips ---
+        # --- Search filter chip (optional, when keyword active) ---
         self._chips_row = QWidget(self)
         self._chips_row.setObjectName("chipsRow")
         self._chips_layout = QHBoxLayout(self._chips_row)
         self._chips_layout.setContentsMargins(0, 0, 0, 0)
         self._chips_layout.setSpacing(6)
-        chips_label = QLabel("Applied filters:", self._chips_row)
-        chips_label.setObjectName("chipsLabel")
-        self._chips_layout.addWidget(chips_label)
         self._chips_layout.addStretch()
         self._chips_row.hide()
         root.addWidget(self._chips_row)
@@ -230,9 +327,9 @@ class HistoryDialog(QDialog):
         table_layout.setSpacing(0)
 
         self._table_stack = QStackedWidget(table_wrap)
-        self._table = QTableWidget(0, 5)
+        self._table = QTableWidget(0, 3)
         self._table.setObjectName("historyTable")
-        self._table.setHorizontalHeaderLabels(["Time", "Prompt", "Model", "Project", "Status"])
+        self._table.setHorizontalHeaderLabels(["Time", "Project / model", ""])
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -245,13 +342,12 @@ class HistoryDialog(QDialog):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSortIndicatorShown(True)
         header.setSectionsClickable(True)
         header.sectionClicked.connect(self._on_header_clicked)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.cellDoubleClicked.connect(lambda _r, _c: self._focus_detail())
+        self._table.verticalHeader().setDefaultSectionSize(52)
         self._table_stack.addWidget(self._table)
 
         self._empty_state = QLabel("No matching history entries")
@@ -265,8 +361,8 @@ class HistoryDialog(QDialog):
         detail_card = QFrame(splitter)
         detail_card.setObjectName("historyDetailCard")
         detail_layout = QVBoxLayout(detail_card)
-        detail_layout.setContentsMargins(16, 16, 16, 16)
-        detail_layout.setSpacing(10)
+        detail_layout.setContentsMargins(12, 12, 12, 12)
+        detail_layout.setSpacing(6)
 
         input_label = QLabel("Original prompt", detail_card)
         input_label.setObjectName("detailLabel")
@@ -289,20 +385,22 @@ class HistoryDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         self._use_prompt_btn = QPushButton("Use prompt", detail_card)
-        self._use_prompt_btn.setObjectName("detailBtn")
+        self._use_prompt_btn.setObjectName("detailBtnPrimary")
         self._use_prompt_btn.setAccessibleName("Use prompt")
         self._use_prompt_btn.clicked.connect(self._emit_use_prompt)
         btn_row.addWidget(self._use_prompt_btn)
 
         self._use_both_btn = QPushButton("Use both", detail_card)
-        self._use_both_btn.setObjectName("detailBtn")
+        self._use_both_btn.setObjectName("detailBtnGhost")
         self._use_both_btn.setAccessibleName("Use both prompt and result")
         self._use_both_btn.clicked.connect(self._emit_use_both)
         btn_row.addWidget(self._use_both_btn)
 
-        self._rerun_btn = QPushButton("Re-run", detail_card)
-        self._rerun_btn.setObjectName("detailBtnAccent")
+        self._rerun_btn = QPushButton("↻", detail_card)
+        self._rerun_btn.setObjectName("detailBtnIcon")
         self._rerun_btn.setAccessibleName("Re-run optimization")
+        self._rerun_btn.setToolTip("Re-run optimization")
+        self._rerun_btn.setFixedSize(36, 36)
         self._rerun_btn.clicked.connect(self._emit_rerun)
         btn_row.addWidget(self._rerun_btn)
 
@@ -408,51 +506,24 @@ class HistoryDialog(QDialog):
             btn.setText(f"{label}  {count}")
 
     def _update_filter_chips(self) -> None:
-        while self._chips_layout.count() > 2:
-            item = self._chips_layout.takeAt(1)
+        while self._chips_layout.count() > 1:
+            item = self._chips_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
         keyword = self._search.text().strip()
-        date_index = self._selected_date_index()
-        has_chips = False
-
         if keyword:
             chip = _FilterChip(f'Search: "{keyword}"  ×', self._chips_row)
             chip.clicked.connect(self._clear_search)
-            self._chips_layout.insertWidget(self._chips_layout.count() - 1, chip)
-            has_chips = True
-
-        if date_index > 0:
-            label = _DATE_RANGE_OPTIONS[date_index][0]
-            chip = _FilterChip(f"{label}  ×", self._chips_row)
-            chip.clicked.connect(self._clear_date_filter)
-            self._chips_layout.insertWidget(self._chips_layout.count() - 1, chip)
-            has_chips = True
-
-        if self._project_filter:
-            chip = _FilterChip(f"Project: {self._project_filter}  ×", self._chips_row)
-            chip.clicked.connect(self._clear_project_filter)
-            self._chips_layout.insertWidget(self._chips_layout.count() - 1, chip)
-            has_chips = True
-
-        self._chips_row.setVisible(has_chips)
+            self._chips_layout.insertWidget(0, chip)
+            self._chips_row.setVisible(True)
+        else:
+            self._chips_row.setVisible(False)
 
     def _clear_search(self) -> None:
         self._search.blockSignals(True)
         self._search.clear()
         self._search.blockSignals(False)
-        self._reload_from_start()
-
-    def _clear_date_filter(self) -> None:
-        self._date_pill_buttons[0].setChecked(True)
-        self._reload_from_start()
-
-    def _clear_project_filter(self) -> None:
-        self._project_combo.blockSignals(True)
-        self._project_combo.setCurrentIndex(0)
-        self._project_combo.blockSignals(False)
-        self._project_filter = None
         self._reload_from_start()
 
     def _reload_from_start(self) -> None:
@@ -482,6 +553,8 @@ class HistoryDialog(QDialog):
 
         if entries:
             self._table.selectRow(0)
+            self._set_row_highlight(0, True)
+            self._highlighted_row = 0
         else:
             self._selected_entry = None
             self._input_detail.clear()
@@ -514,28 +587,43 @@ class HistoryDialog(QDialog):
 
     def _populate_table(self, entries: list[dict[str, Any]]) -> None:
         self._table.setSortingEnabled(False)
+        self._highlighted_row = -1
         self._table.setRowCount(len(entries))
         for row, entry in enumerate(entries):
             raw_ts = str(entry.get("timestamp") or "")
             ts_item = QTableWidgetItem(_format_timestamp(raw_ts))
             ts_item.setData(Qt.ItemDataRole.UserRole, raw_ts)
-            preview_item = QTableWidgetItem(_preview(str(entry.get("input") or "")))
-            model_item = QTableWidgetItem(str(entry.get("model") or ""))
-            project_item = QTableWidgetItem(str(entry.get("project_name") or "—"))
-            status_item = QTableWidgetItem("Optimized")
-            status_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
-            )
-            status_item.setForeground(QColor(_C["success"]))
-            for item in (ts_item, preview_item, model_item, project_item, status_item):
+
+            project_item = QTableWidgetItem("")
+            status_item = QTableWidgetItem("")
+
+            for item in (ts_item, project_item, status_item):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 item.setData(Qt.ItemDataRole.UserRole + 1, entry)
+
             self._table.setItem(row, 0, ts_item)
-            self._table.setItem(row, 1, preview_item)
-            self._table.setItem(row, 2, model_item)
-            self._table.setItem(row, 3, project_item)
-            self._table.setItem(row, 4, status_item)
+            self._table.setItem(row, 1, project_item)
+            self._table.setItem(row, 2, status_item)
+
+            project_name = str(entry.get("project_name") or "").strip() or None
+            model_name = str(entry.get("model") or "")
+            self._table.setCellWidget(
+                row,
+                1,
+                _ProjectModelCell(project_name, model_name, self._table),
+            )
+            self._table.setCellWidget(row, 2, _StatusIconCell(self._table))
         self._table.setSortingEnabled(True)
+
+    def _set_row_highlight(self, row: int, selected: bool) -> None:
+        if row < 0 or row >= self._table.rowCount():
+            return
+        project_cell = self._table.cellWidget(row, 1)
+        status_cell = self._table.cellWidget(row, 2)
+        if isinstance(project_cell, _ProjectModelCell):
+            project_cell.set_selected(selected)
+        if isinstance(status_cell, _StatusIconCell):
+            status_cell.set_selected(selected)
 
     def _on_header_clicked(self, logical_index: int) -> None:
         if logical_index == 0:
@@ -576,7 +664,14 @@ class HistoryDialog(QDialog):
         return entry if isinstance(entry, dict) else None
 
     def _on_selection_changed(self) -> None:
+        prev_row = self._highlighted_row
         row = self._selected_row()
+        if prev_row >= 0 and prev_row != row:
+            self._set_row_highlight(prev_row, False)
+        if row >= 0:
+            self._set_row_highlight(row, True)
+        self._highlighted_row = row
+
         entry = self._entry_for_row(row)
         if entry is None:
             self._selected_entry = None

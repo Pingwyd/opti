@@ -1,5 +1,5 @@
 """
-Gemini / Groq / OpenRouter / Anthropic API wrapper for MetaPrompt.
+Gemini / Groq / OpenRouter / Anthropic API wrapper for Opti.
 
 Provider is selected via config.json "provider". The API key stays in Python
 only — never exposed to the popup UI or external scripts.
@@ -12,6 +12,7 @@ import re
 import time
 from typing import Callable, Optional
 
+from brand import APP_NAME, GITHUB_URL
 from config import get_active_model, get_api_key, get_provider
 from projects import get_active_project, get_include_project_context_in_private, touch_project_last_used
 from prompt import SYSTEM_PROMPT, build_system_prompt
@@ -304,8 +305,8 @@ _OPENAI_COMPAT = {
         "base_url": "https://openrouter.ai/api/v1",
         "label": "OpenRouter",
         "default_headers": {
-            "HTTP-Referer": "https://github.com/local/metaprompt",
-            "X-Title": "MetaPrompt",
+            "HTTP-Referer": GITHUB_URL,
+            "X-Title": APP_NAME,
         },
     },
 }

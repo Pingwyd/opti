@@ -1,0 +1,74 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -q --ignore=tests/test_voice.py
+
+      - name: Build portable (PyInstaller)
+        run: pyinstaller packaging/opti.spec --noconfirm --clean
+
+      - name: Add portable marker
+        working-directory: dist/Opti
+        run: copy ..\..\packaging\portable.txt portable.txt
+
+      - name: Zip portable build
+        working-directory: dist
+        run: powershell Compress-Archive -Path Opti -DestinationPath Opti-portable.zip -Force
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        working-directory: packaging
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Opti-portable-windows
+          path: dist/Opti-portable.zip
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Opti-setup-windows
+          path: packaging/Output/Opti-Setup-*.exe
+
+      - name: Create GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Opti-portable.zip
+            packaging/Output/Opti-Setup-*.exe
+          generate_release_notes: true

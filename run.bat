@@ -1,9 +1,10 @@
 @echo off
-REM Launch MetaPrompt without a console window (uses venv if present).
+REM Launch Opti without a console window (uses venv if present).
 cd /d "%~dp0"
-
-if exist "%~dp0.venv\Scripts\pythonw.exe" (
-  start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0main.py"
+if exist ".venv\Scripts\pythonw.exe" (
+  start "" ".venv\Scripts\pythonw.exe" main.py
+) else if exist ".venv\Scripts\python.exe" (
+  start "" ".venv\Scripts\python.exe" main.py
 ) else (
-  start "" pythonw "%~dp0main.py"
+  start "" pythonw main.py
 )

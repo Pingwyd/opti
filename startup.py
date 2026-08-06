@@ -1,5 +1,5 @@
 """
-Windows Startup-folder helpers for MetaPrompt auto-launch on login.
+Windows Startup-folder helpers for Opti auto-launch on login.
 """
 
 from __future__ import annotations
@@ -7,10 +7,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from config import APP_DIR, load_config, save_config
+from brand import APP_NAME
+from config import load_config, save_config
+from paths import BUNDLE_DIR, INSTALL_DIR
 
 # Shortcut / launcher name inside the user's Startup folder
-STARTUP_NAME = "MetaPrompt.bat"
+STARTUP_NAME = f"{APP_NAME}.bat"
 
 
 def _startup_folder() -> Path:
@@ -27,26 +29,32 @@ def is_start_with_windows_enabled() -> bool:
     return startup_shortcut_path().exists()
 
 
+def _launch_command() -> tuple[str, str]:
+    """Return (working_directory, command_line) for the startup .bat."""
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        return str(exe.parent), f'start "" "{exe}"'
+    main_py = BUNDLE_DIR / "main.py"
+    python = Path(sys.executable)
+    pythonw = python.with_name("pythonw.exe")
+    interpreter = str(pythonw if pythonw.exists() else python)
+    return str(BUNDLE_DIR), f'start "" "{interpreter}" "{main_py}"'
+
+
 def enable_start_with_windows() -> Path:
     """
-    Write a .bat launcher into the Startup folder that runs main.py with pythonw
-    (no console window). Returns the path to the created file.
+    Write a .bat launcher into the Startup folder.
+    Returns the path to the created file.
     """
     startup = _startup_folder()
     startup.mkdir(parents=True, exist_ok=True)
     target = startup_shortcut_path()
 
-    main_py = APP_DIR / "main.py"
-    # Prefer pythonw.exe so no console flashes on login
-    python = Path(sys.executable)
-    pythonw = python.with_name("pythonw.exe")
-    interpreter = str(pythonw if pythonw.exists() else python)
-
-    # /d sets drive+dir; quote paths for spaces (e.g. "_Coding Projects")
+    work_dir, launch = _launch_command()
     bat = (
         "@echo off\r\n"
-        f'cd /d "{APP_DIR}"\r\n'
-        f'start "" "{interpreter}" "{main_py}"\r\n'
+        f'cd /d "{work_dir}"\r\n'
+        f"{launch}\r\n"
     )
     target.write_text(bat, encoding="utf-8")
 

@@ -89,6 +89,39 @@ def test_query_entries_project_filter(isolated_history, isolated_config):
     assert page[0]["project_name"] == "Beta"
 
 
+def test_query_entries_date_range(isolated_history):
+    now = datetime.now(timezone.utc)
+    entries = []
+    for days_ago in (2, 10, 45, 120):
+        entries.append(
+            {
+                "id": f"id-{days_ago}",
+                "timestamp": (now - timedelta(days=days_ago)).isoformat(),
+                "input": f"prompt {days_ago}",
+                "output": f"out {days_ago}",
+                "model": "test-model",
+                "tags": [],
+                "excluded_from_save": False,
+            }
+        )
+    isolated_history.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+    today = now.date()
+    start_7 = today - timedelta(days=6)
+    start_30 = today - timedelta(days=29)
+    start_90 = today - timedelta(days=89)
+
+    _, total_all = history.query_entries(limit=100)
+    _, total_7 = history.query_entries(date_from=start_7, date_to=today, limit=100)
+    _, total_30 = history.query_entries(date_from=start_30, date_to=today, limit=100)
+    _, total_90 = history.query_entries(date_from=start_90, date_to=today, limit=100)
+
+    assert total_all == 4
+    assert total_7 == 1
+    assert total_30 == 2
+    assert total_90 == 3
+
+
 def test_save_history_false_skips_add_entry(isolated_history, isolated_config):
     config.load_config()
     cfg = config.load_config()

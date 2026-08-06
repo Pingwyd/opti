@@ -16,6 +16,7 @@ from config import (
     normalize_shortcut_string,
     shortcuts_equal,
 )
+from brand import SETUP_TITLE, SETTINGS_TITLE
 from settings_ui import (
     HISTORY_LIMIT_MAX,
     HISTORY_LIMIT_MIN,
@@ -54,6 +55,8 @@ def _base_settings_kwargs(**overrides):
         "exclude_sensitive": False,
         "history_limit": 50,
         "start_with_windows": False,
+        "start_minimized_to_tray": True,
+        "check_updates_on_launch": False,
         "shortcut_collapse": DEFAULT_SHORTCUT_COLLAPSE,
         "shortcut_hide_tray": DEFAULT_SHORTCUT_HIDE_TRAY,
         "shortcut_private": DEFAULT_SHORTCUT_PRIVATE,
@@ -125,10 +128,10 @@ def test_apply_settings_requires_api_key_on_first_run(isolated_config):
 def test_settings_dialog_instantiation(qapp, isolated_config):
     config.load_config()
     dlg = SettingsDialog()
-    assert dlg.windowTitle() == "MetaPrompt settings"
+    assert dlg.windowTitle() == SETTINGS_TITLE
 
     first_run = SettingsDialog(first_run=True)
-    assert first_run.windowTitle() == "MetaPrompt setup"
+    assert first_run.windowTitle() == SETUP_TITLE
 
 
 def test_shortcut_config_defaults(isolated_config):
@@ -245,6 +248,39 @@ def test_apply_settings_rejects_global_collapse_matching_shortcut(isolated_confi
         apply_settings_values(values)
         == "Global hotkeys cannot match an in-app shortcut."
     )
+
+
+def test_startup_config_defaults(isolated_config):
+    cfg = config.load_config()
+    assert cfg["start_minimized_to_tray"] is True
+    assert cfg["check_updates_on_launch"] is False
+
+
+def test_apply_settings_startup_options_round_trip(isolated_config):
+    config.load_config()
+    values = build_settings_values(
+        **_base_settings_kwargs(
+            start_minimized_to_tray=False,
+            check_updates_on_launch=True,
+        )
+    )
+    assert apply_settings_values(values) is None
+
+    cfg = config.load_config()
+    assert cfg["start_minimized_to_tray"] is False
+    assert cfg["check_updates_on_launch"] is True
+    assert config.get_start_minimized_to_tray() is False
+    assert config.get_check_updates_on_launch() is True
+
+
+def test_settings_dialog_save_button_dirty_state(qapp, isolated_config):
+    config.load_config()
+    dlg = SettingsDialog()
+    assert dlg._save_btn.property("dirty") == "false"
+
+    dlg._mode_combo.setCurrentIndex(1)
+    qapp.processEvents()
+    assert dlg._save_btn.property("dirty") == "true"
 
 
 def test_hotkey_collapse_config_defaults(isolated_config):

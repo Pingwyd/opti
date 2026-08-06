@@ -1,5 +1,5 @@
 """
-PyQt6 settings dialog for MetaPrompt configuration.
+PyQt6 settings dialog for Opti configuration.
 """
 
 from __future__ import annotations
@@ -10,11 +10,12 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
-    QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
@@ -22,9 +23,9 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
-    QSplitter,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -37,9 +38,11 @@ from config import (
     DEFAULT_SHORTCUT_COLLAPSE,
     DEFAULT_SHORTCUT_HIDE_TRAY,
     DEFAULT_SHORTCUT_PRIVATE,
+    DEFAULT_VOICE_PTT_SHORTCUT,
     PROVIDER_PRESETS,
     RESCUE_WINDOW_SHORTCUT,
     VALID_PROVIDERS,
+    VALID_VOICE_MODEL_SIZES,
     get_provider,
     has_api_key,
     global_hotkeys_conflict,
@@ -64,6 +67,7 @@ from projects import (
     parse_tech_stack_input,
     update_project,
 )
+from brand import APP_NAME, SETUP_TITLE, SETTINGS_TITLE
 from ui_theme import settings_stylesheet
 
 HISTORY_LIMIT_MIN = 50
@@ -87,11 +91,20 @@ def build_settings_values(
     exclude_sensitive: bool,
     history_limit: int,
     start_with_windows: bool,
+    start_minimized_to_tray: bool = True,
+    check_updates_on_launch: bool = False,
     shortcut_collapse: str,
     shortcut_hide_tray: str,
     shortcut_private: str,
     auto_copy_clipboard: bool,
+    auto_inject_enabled: bool = False,
     include_project_context_in_private: bool = False,
+    voice_enabled: bool = False,
+    voice_transcription_mode: str = "local",
+    voice_recording_mode: str = "push_to_talk",
+    voice_model_size: str = "base",
+    voice_toggle_max_seconds: int = 60,
+    voice_ptt_shortcut: str = DEFAULT_VOICE_PTT_SHORTCUT,
 ) -> dict[str, Any]:
     """Build a config patch from form field values (testable without Qt)."""
     return {
@@ -107,6 +120,8 @@ def build_settings_values(
         "exclude_sensitive": exclude_sensitive,
         "history_limit": max(HISTORY_LIMIT_MIN, min(HISTORY_LIMIT_MAX, history_limit)),
         "start_with_windows": start_with_windows,
+        "start_minimized_to_tray": start_minimized_to_tray,
+        "check_updates_on_launch": check_updates_on_launch,
         "shortcut_collapse": normalize_shortcut_string(
             shortcut_collapse, DEFAULT_SHORTCUT_COLLAPSE
         ),
@@ -117,7 +132,22 @@ def build_settings_values(
             shortcut_private, DEFAULT_SHORTCUT_PRIVATE
         ),
         "auto_copy_clipboard": auto_copy_clipboard,
+        "auto_inject_enabled": auto_inject_enabled,
         "include_project_context_in_private": include_project_context_in_private,
+        "voice_enabled": voice_enabled,
+        "voice_transcription_mode": (
+            "local" if str(voice_transcription_mode).lower() != "cloud" else "cloud"
+        ),
+        "voice_recording_mode": (
+            "toggle"
+            if str(voice_recording_mode).lower() == "toggle"
+            else "push_to_talk"
+        ),
+        "voice_model_size": str(voice_model_size or "base").lower().strip(),
+        "voice_toggle_max_seconds": max(5, min(600, int(voice_toggle_max_seconds))),
+        "voice_ptt_shortcut": normalize_shortcut_string(
+            voice_ptt_shortcut, DEFAULT_VOICE_PTT_SHORTCUT
+        ),
     }
 
 
@@ -178,12 +208,24 @@ def apply_settings_values(values: dict[str, Any], *, require_api_key: bool = Fal
     cfg["exclude_sensitive"] = bool(values.get("exclude_sensitive", False))
     cfg["history_limit"] = int(values.get("history_limit") or 50)
     cfg["start_with_windows"] = bool(values.get("start_with_windows", False))
+    cfg["start_minimized_to_tray"] = bool(values.get("start_minimized_to_tray", True))
+    cfg["check_updates_on_launch"] = bool(values.get("check_updates_on_launch", False))
     cfg["shortcut_collapse"] = shortcut_collapse
     cfg["shortcut_hide_tray"] = shortcut_hide_tray
     cfg["shortcut_private"] = shortcut_private
     cfg["auto_copy_clipboard"] = bool(values.get("auto_copy_clipboard", True))
+    cfg["auto_inject_enabled"] = bool(values.get("auto_inject_enabled", False))
     cfg["include_project_context_in_private"] = bool(
         values.get("include_project_context_in_private", False)
+    )
+    cfg["voice_enabled"] = bool(values.get("voice_enabled", False))
+    cfg["voice_transcription_mode"] = str(values.get("voice_transcription_mode") or "local")
+    cfg["voice_recording_mode"] = str(values.get("voice_recording_mode") or "push_to_talk")
+    cfg["voice_model_size"] = str(values.get("voice_model_size") or "base")
+    cfg["voice_toggle_max_seconds"] = int(values.get("voice_toggle_max_seconds") or 60)
+    cfg["voice_ptt_shortcut"] = normalize_shortcut_string(
+        str(values.get("voice_ptt_shortcut") or ""),
+        DEFAULT_VOICE_PTT_SHORTCUT,
     )
     save_config(cfg)
 
@@ -201,7 +243,7 @@ def apply_settings_values(values: dict[str, Any], *, require_api_key: bool = Fal
 
 
 class TagInputWidget(QWidget):
-    """Tech-stack tag editor: type + Enter or comma to add, × to remove."""
+    """Tech-stack tag editor inside a single bordered box with inline add input."""
 
     tags_changed = pyqtSignal()
 
@@ -209,25 +251,32 @@ class TagInputWidget(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(0)
 
-        self._input = QLineEdit(self)
-        self._input.setPlaceholderText(
-            "Type a technology and press Enter, or separate with commas"
-        )
-        self._input.setMinimumHeight(36)
-        self._input.returnPressed.connect(self._add_from_input)
-        self._input.textChanged.connect(self._on_input_changed)
-        layout.addWidget(self._input)
+        self._box = QFrame(self)
+        self._box.setObjectName("tagBox")
+        box_layout = QVBoxLayout(self._box)
+        box_layout.setContentsMargins(8, 8, 8, 8)
+        box_layout.setSpacing(6)
 
-        self._list = QListWidget(self)
+        self._list = QListWidget(self._box)
         self._list.setObjectName("tagList")
         self._list.setFlow(QListWidget.Flow.LeftToRight)
         self._list.setWrapping(True)
+        self._list.setFrameShape(QFrame.Shape.NoFrame)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._list.setMaximumHeight(120)
-        layout.addWidget(self._list)
+        box_layout.addWidget(self._list)
+
+        self._input = QLineEdit(self._box)
+        self._input.setObjectName("tagInlineInput")
+        self._input.setPlaceholderText("Add technology...")
+        self._input.returnPressed.connect(self._add_from_input)
+        self._input.textChanged.connect(self._on_input_changed)
+        box_layout.addWidget(self._input)
+
+        layout.addWidget(self._box)
 
     def tags(self) -> list[str]:
         result: list[str] = []
@@ -298,8 +347,9 @@ class TagInputWidget(QWidget):
         item.setData(Qt.ItemDataRole.UserRole, normalized)
         self._list.addItem(item)
         chip = QWidget(self._list)
+        chip.setObjectName("tagChipWidget")
         chip_layout = QHBoxLayout(chip)
-        chip_layout.setContentsMargins(8, 4, 4, 4)
+        chip_layout.setContentsMargins(8, 3, 6, 3)
         chip_layout.setSpacing(4)
         label = QLabel(normalized, chip)
         label.setObjectName("tagChipLabel")
@@ -311,12 +361,19 @@ class TagInputWidget(QWidget):
         chip_layout.addWidget(label)
         chip_layout.addWidget(remove_btn)
         self._list.setItemWidget(item, chip)
+        item.setSizeHint(chip.sizeHint())
         if emit:
             self._refresh_tag_layout()
             self.tags_changed.emit()
         return True
 
     def _refresh_tag_layout(self) -> None:
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            if item is not None:
+                widget = self._list.itemWidget(item)
+                if widget is not None:
+                    item.setSizeHint(widget.sizeHint())
         self._list.scheduleDelayedItemsLayout()
         self._list.updateGeometry()
 
@@ -326,6 +383,50 @@ class TagInputWidget(QWidget):
             self._list.takeItem(row)
             self._refresh_tag_layout()
             self.tags_changed.emit()
+
+
+class ProjectListItemWidget(QFrame):
+    """Single project row: name + project-type subtitle."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        project_type: str,
+        active: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("projectListCard")
+        self.setProperty("active", "true" if active else "false")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(2)
+
+        self._name_label = QLabel(name.strip() or "Project", self)
+        self._name_label.setObjectName("projectItemName")
+        self._name_label.setProperty("active", "true" if active else "false")
+        layout.addWidget(self._name_label)
+
+        subtitle = (project_type or "").strip() or " "
+        self._type_label = QLabel(subtitle, self)
+        self._type_label.setObjectName("projectItemType")
+        self._type_label.setProperty("active", "true" if active else "false")
+        layout.addWidget(self._type_label)
+
+    def set_active(self, active: bool) -> None:
+        flag = "true" if active else "false"
+        self.setProperty("active", flag)
+        self._name_label.setProperty("active", flag)
+        self._type_label.setProperty("active", flag)
+        for widget in (self, self._name_label, self._type_label):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+    def update_labels(self, *, name: str, project_type: str) -> None:
+        self._name_label.setText(name.strip() or "Project")
+        subtitle = (project_type or "").strip() or " "
+        self._type_label.setText(subtitle)
 
 
 class SettingsDialog(QDialog):
@@ -352,16 +453,21 @@ class SettingsDialog(QDialog):
         self._new_project = new_project
         self._selected_project_id: str | None = None
         self._projects_is_new = False
+        self._snapshot: dict[str, Any] = {}
+        self._project_item_widgets: dict[str, ProjectListItemWidget] = {}
 
-        self.setWindowTitle("MetaPrompt setup" if first_run else "MetaPrompt settings")
+        self.setWindowTitle(SETUP_TITLE if first_run else SETTINGS_TITLE)
         self.setModal(True)
-        self.resize(560, 620)
-        self.setMinimumWidth(500)
-        self.setMinimumHeight(480)
+        self.resize(600, 640)
+        self.setMinimumWidth(540)
+        self.setMinimumHeight(500)
 
         self._build_ui()
         self.setStyleSheet(settings_stylesheet())
         self._load_from_config()
+        self._snapshot = self._collect_values()
+        self._connect_dirty_tracking()
+        self._update_dirty_state()
         self._wire_tab_order()
 
         if self._new_project:
@@ -434,6 +540,7 @@ class SettingsDialog(QDialog):
         save_btn.setMinimumHeight(36)
         save_btn.clicked.connect(self._on_save)
         btn_row.addWidget(save_btn)
+        self._save_btn = save_btn
 
         root.addLayout(btn_row)
 
@@ -480,23 +587,103 @@ class SettingsDialog(QDialog):
         return desc
 
     @staticmethod
-    def _group_box(title: str, parent: QWidget) -> QGroupBox:
-        group = QGroupBox(title, parent)
-        group.setObjectName("settingsGroup")
-        return group
+    def _section_header(text: str, parent: QWidget) -> QLabel:
+        label = QLabel(text, parent)
+        label.setObjectName("sectionHeader")
+        return label
 
-    def _add_key_edit(
+    @staticmethod
+    def _settings_panel(parent: QWidget) -> QFrame:
+        panel = QFrame(parent)
+        panel.setObjectName("settingsPanel")
+        return panel
+
+    def _info_icon(self, tooltip: str, parent: QWidget) -> QLabel:
+        icon = QLabel("\u2139", parent)
+        icon.setObjectName("infoIcon")
+        icon.setToolTip(tooltip)
+        icon.setCursor(Qt.CursorShape.WhatsThisCursor)
+        return icon
+
+    def _link_button(self, text: str, parent: QWidget, *, on_click) -> QPushButton:  # noqa: ANN001
+        btn = QPushButton(text, parent)
+        btn.setObjectName("linkBtn")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFlat(True)
+        btn.clicked.connect(on_click)
+        return btn
+
+    def _checkbox_panel(self, checkbox: QCheckBox, parent: QWidget) -> QFrame:
+        panel = self._settings_panel(parent)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(12, 12, 12, 12)
+        panel_layout.setSpacing(0)
+        panel_layout.addWidget(checkbox)
+        return panel
+
+    def _add_section(
         self,
         layout: QVBoxLayout,
+        title: str,
+        parent: QWidget,
+    ) -> tuple[QLabel, QFrame, QVBoxLayout]:
+        header = self._section_header(title, parent)
+        layout.addWidget(header)
+        panel = self._settings_panel(parent)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(12, 12, 12, 12)
+        panel_layout.setSpacing(_FIELD_SPACING)
+        layout.addWidget(panel)
+        return header, panel, panel_layout
+
+    def _shortcut_row(
+        self,
         label_text: str,
         default: str,
         parent: QWidget,
+        panel_layout: QVBoxLayout,
+        *,
+        tooltip: str | None = None,
     ) -> QKeySequenceEdit:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        label_container = QHBoxLayout()
+        label_container.setSpacing(4)
+        label = QLabel(label_text, parent)
+        label.setObjectName("shortcutLabel")
+        label_container.addWidget(label)
+        if tooltip:
+            label_container.addWidget(self._info_icon(tooltip, parent))
+        label_container.addStretch()
+        row.addLayout(label_container, stretch=1)
         edit = QKeySequenceEdit(QKeySequence(default), parent)
         edit.setObjectName("shortcutEdit")
+        edit.setFixedWidth(110)
+        row.addWidget(edit)
+        panel_layout.addLayout(row)
+        return edit
+
+    def _model_field(
+        self,
+        label_text: str,
+        parent: QWidget,
+        panel_layout: QVBoxLayout,
+        *,
+        on_reset,
+    ) -> QLineEdit:
+        header = QHBoxLayout()
+        header.addWidget(self._field_label(label_text, parent))
+        header.addStretch()
+        reset_btn = self._link_button(
+            "Reset to default",
+            parent,
+            on_click=on_reset,
+        )
+        header.addWidget(reset_btn)
+        panel_layout.addLayout(header)
+        edit = QLineEdit(parent)
         edit.setMinimumHeight(36)
-        layout.addWidget(self._field_label(label_text, parent, buddy=edit))
-        layout.addWidget(edit)
+        panel_layout.addWidget(edit)
         return edit
 
     def _build_general_tab(self) -> QWidget:
@@ -505,83 +692,131 @@ class SettingsDialog(QDialog):
         layout.addWidget(
             self._tab_description("API connection and default behavior", body)
         )
-        connection = self._group_box("Connection", body)
-        conn_layout = QVBoxLayout(connection)
-        conn_layout.setContentsMargins(16, 20, 16, 16)
-        conn_layout.setSpacing(_FIELD_SPACING)
 
-        self._provider_combo = QComboBox(connection)
+        _, _connection_panel, conn_layout = self._add_section(layout, "Connection", body)
+
+        self._provider_combo = QComboBox(body)
         self._provider_combo.setMinimumHeight(36)
         for provider_id in VALID_PROVIDERS:
             self._provider_combo.addItem(PROVIDER_PRESETS[provider_id]["label"], provider_id)
         self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
-        conn_layout.addWidget(self._field_label("Provider", connection, buddy=self._provider_combo))
+        conn_layout.addWidget(self._field_label("Provider", body, buddy=self._provider_combo))
         conn_layout.addWidget(self._provider_combo)
 
-        self._api_key_input = QLineEdit(connection)
+        self._api_key_input = QLineEdit(body)
         self._api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self._api_key_input.setPlaceholderText("Paste key here (leave blank to keep current)")
         self._api_key_input.setMinimumHeight(36)
-        conn_layout.addWidget(self._field_label("API key", connection, buddy=self._api_key_input))
+        conn_layout.addWidget(self._field_label("API key", body, buddy=self._api_key_input))
         conn_layout.addWidget(self._api_key_input)
 
-        layout.addWidget(connection)
+        _, _behavior_panel, behavior_layout = self._add_section(layout, "Default behavior", body)
 
-        behavior = self._group_box("Default behavior", body)
-        behavior_layout = QVBoxLayout(behavior)
-        behavior_layout.setContentsMargins(16, 20, 16, 16)
-        behavior_layout.setSpacing(_FIELD_SPACING)
-
-        self._mode_combo = QComboBox(behavior)
+        self._mode_combo = QComboBox(body)
         self._mode_combo.setMinimumHeight(36)
         self._mode_combo.addItem("Thorough", "thorough")
         self._mode_combo.addItem("Fast", "fast")
-        behavior_layout.addWidget(self._field_label("Default mode", behavior, buddy=self._mode_combo))
+        behavior_layout.addWidget(
+            self._field_label("Default mode", body, buddy=self._mode_combo)
+        )
         behavior_layout.addWidget(self._mode_combo)
 
-        self._persist_draft_cb = QCheckBox("Remember draft text between sessions", behavior)
+        self._persist_draft_cb = QCheckBox("Remember draft text between sessions", body)
         behavior_layout.addWidget(self._persist_draft_cb)
 
-        layout.addWidget(behavior)
+        _, _voice_panel, voice_layout = self._add_section(layout, "Voice input", body)
 
-        window_group = self._group_box("Window position", body)
-        window_layout = QVBoxLayout(window_group)
-        window_layout.setContentsMargins(16, 20, 16, 16)
-        window_layout.setSpacing(_FIELD_SPACING)
-        window_layout.addWidget(
-            self._hint_label(
-                "If MetaPrompt ends up off-screen after a monitor change, reset it "
-                f"to the center of your primary display. With the popup focused, "
-                f"you can also press {RESCUE_WINDOW_SHORTCUT}.",
-                window_group,
-            )
-        )
-        reset_btn = QPushButton("Reset window position", window_group)
-        reset_btn.setObjectName("saveBtn")
-        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        reset_btn.setMinimumHeight(36)
-        reset_btn.clicked.connect(self._on_reset_window_position_clicked)
-        window_layout.addWidget(reset_btn)
-        self._window_reset_status = QLabel("", window_group)
-        self._window_reset_status.setObjectName("fieldHint")
-        self._window_reset_status.hide()
-        window_layout.addWidget(self._window_reset_status)
-        layout.addWidget(window_group)
-        if self._first_run:
-            window_group.hide()
+        self._voice_enabled_cb = QCheckBox("Enable voice input", body)
+        voice_layout.addWidget(self._voice_enabled_cb)
 
-        hotkey_note = self._group_box("Global hotkey", body)
-        note_layout = QVBoxLayout(hotkey_note)
-        note_layout.setContentsMargins(16, 20, 16, 16)
-        note_layout.setSpacing(_FIELD_SPACING)
-        note_layout.addWidget(
-            self._hint_label(
-                "The system-wide shortcuts to open or collapse MetaPrompt are configured under "
-                "the Shortcuts tab. On macOS, grant Accessibility to this app.",
-                hotkey_note,
-            )
+        transcription_row = QHBoxLayout()
+        transcription_row.setSpacing(12)
+        transcription_row.addWidget(self._field_label("Transcription", body))
+        self._voice_local_radio = QRadioButton("Local", body)
+        self._voice_cloud_radio = QRadioButton("Cloud", body)
+        self._voice_cloud_radio.setEnabled(False)
+        self._voice_cloud_radio.setToolTip("Coming soon")
+        self._voice_transcription_group = QButtonGroup(body)
+        self._voice_transcription_group.addButton(self._voice_local_radio)
+        self._voice_transcription_group.addButton(self._voice_cloud_radio)
+        self._voice_local_radio.setChecked(True)
+        transcription_row.addWidget(self._voice_local_radio)
+        transcription_row.addWidget(self._voice_cloud_radio)
+        transcription_row.addStretch()
+        voice_layout.addLayout(transcription_row)
+
+        self._voice_cloud_note = self._hint_label("Cloud transcription — coming soon.", body)
+        voice_layout.addWidget(self._voice_cloud_note)
+
+        self._voice_private_note = self._hint_label(
+            "Private mode requires local transcription.", body
         )
-        layout.addWidget(hotkey_note)
+        voice_layout.addWidget(self._voice_private_note)
+
+        recording_row = QHBoxLayout()
+        recording_row.setSpacing(12)
+        recording_row.addWidget(self._field_label("Recording mode", body))
+        self._voice_ptt_radio = QRadioButton("Push-to-talk", body)
+        self._voice_toggle_radio = QRadioButton("Toggle", body)
+        self._voice_recording_group = QButtonGroup(body)
+        self._voice_recording_group.addButton(self._voice_ptt_radio)
+        self._voice_recording_group.addButton(self._voice_toggle_radio)
+        self._voice_ptt_radio.setChecked(True)
+        recording_row.addWidget(self._voice_ptt_radio)
+        recording_row.addWidget(self._voice_toggle_radio)
+        recording_row.addStretch()
+        voice_layout.addLayout(recording_row)
+
+        model_row = QHBoxLayout()
+        self._voice_model_combo = QComboBox(body)
+        self._voice_model_combo.setMinimumHeight(36)
+        self._voice_model_combo.setFixedWidth(140)
+        for size in VALID_VOICE_MODEL_SIZES:
+            self._voice_model_combo.addItem(size, size)
+        model_row.addWidget(self._field_label("Local model size", body, buddy=self._voice_model_combo))
+        model_row.addStretch()
+        model_row.addWidget(self._voice_model_combo)
+        voice_layout.addLayout(model_row)
+
+        toggle_max_row = QHBoxLayout()
+        self._voice_toggle_max_spin = QSpinBox(body)
+        self._voice_toggle_max_spin.setRange(5, 600)
+        self._voice_toggle_max_spin.setSuffix(" s")
+        self._voice_toggle_max_spin.setMinimumHeight(36)
+        self._voice_toggle_max_spin.setFixedWidth(90)
+        toggle_max_row.addWidget(
+            self._field_label("Max toggle recording duration", body, buddy=self._voice_toggle_max_spin)
+        )
+        toggle_max_row.addStretch()
+        toggle_max_row.addWidget(self._voice_toggle_max_spin)
+        voice_layout.addLayout(toggle_max_row)
+
+        self._voice_ptt_shortcut_edit = self._shortcut_row(
+            "Push-to-talk shortcut (popup focused)",
+            DEFAULT_VOICE_PTT_SHORTCUT,
+            body,
+            voice_layout,
+            tooltip=(
+                "Hold this key while the pill is focused to record. "
+                f"Not global — works only when {APP_NAME} is focused."
+            ),
+        )
+
+        if not self._first_run:
+            _, _window_panel, window_layout = self._add_section(layout, "Window position", body)
+            reset_btn = QPushButton("Reset window position", body)
+            reset_btn.setObjectName("cancelBtn")
+            reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            reset_btn.setMinimumHeight(36)
+            reset_btn.clicked.connect(self._on_reset_window_position_clicked)
+            window_layout.addWidget(reset_btn)
+            self._window_reset_status = QLabel("", body)
+            self._window_reset_status.setObjectName("fieldHint")
+            self._window_reset_status.hide()
+            window_layout.addWidget(self._window_reset_status)
+        else:
+            self._window_reset_status = QLabel("", body)
+            self._window_reset_status.hide()
 
         layout.addStretch()
         return self._scroll_tab(body)
@@ -590,32 +825,37 @@ class SettingsDialog(QDialog):
         body = self._tab_body()
         layout: QVBoxLayout = body._layout  # type: ignore[attr-defined]
         layout.addWidget(self._tab_description("LLM model IDs per provider", body))
-        models = self._group_box("Model IDs", body)
-        models_layout = QVBoxLayout(models)
-        models_layout.setContentsMargins(16, 20, 16, 16)
+
+        models_panel = self._settings_panel(body)
+        models_layout = QVBoxLayout(models_panel)
+        models_layout.setContentsMargins(12, 12, 12, 12)
         models_layout.setSpacing(_FIELD_SPACING)
 
-        self._model_input = QLineEdit(models)
-        self._model_input.setMinimumHeight(36)
-        models_layout.addWidget(self._field_label("Thorough model", models, buddy=self._model_input))
-        models_layout.addWidget(self._model_input)
-
-        self._model_fast_input = QLineEdit(models)
-        self._model_fast_input.setMinimumHeight(36)
-        models_layout.addWidget(
-            self._field_label("Fast model", models, buddy=self._model_fast_input)
+        self._model_input = self._model_field(
+            "Thorough model",
+            body,
+            models_layout,
+            on_reset=lambda: self._reset_model_field("model"),
         )
-        models_layout.addWidget(self._model_fast_input)
+        self._model_fast_input = self._model_field(
+            "Fast model",
+            body,
+            models_layout,
+            on_reset=lambda: self._reset_model_field("model_fast"),
+        )
 
-        models_layout.addWidget(
-            self._hint_label(
-                "Changing provider resets these to that provider's defaults. "
-                "Override only if you know the exact model ID.",
-                models,
+        hint_row = QHBoxLayout()
+        hint_row.setSpacing(4)
+        hint_row.addWidget(
+            self._info_icon(
+                "Changing provider resets these to that provider's defaults.",
+                body,
             )
         )
+        hint_row.addStretch()
+        models_layout.addLayout(hint_row)
+        layout.addWidget(models_panel)
 
-        layout.addWidget(models)
         layout.addStretch()
         return self._scroll_tab(body)
 
@@ -623,60 +863,56 @@ class SettingsDialog(QDialog):
         body = self._tab_body()
         layout: QVBoxLayout = body._layout  # type: ignore[attr-defined]
         layout.addWidget(self._tab_description("History and clipboard", body))
-        history = self._group_box("History", body)
-        history_layout = QVBoxLayout(history)
-        history_layout.setContentsMargins(16, 20, 16, 16)
-        history_layout.setSpacing(_FIELD_SPACING)
 
-        self._save_history_cb = QCheckBox("Save optimization history", history)
+        _, _history_panel, history_layout = self._add_section(layout, "History", body)
+
+        self._save_history_cb = QCheckBox("Save optimization history", body)
         history_layout.addWidget(self._save_history_cb)
 
         self._exclude_sensitive_cb = QCheckBox(
-            "Don't save prompts containing sensitive patterns", history
+            "Don't save prompts containing sensitive patterns", body
         )
         history_layout.addWidget(self._exclude_sensitive_cb)
 
         limit_row = QHBoxLayout()
-        self._history_limit_spin = QSpinBox(history)
+        self._history_limit_spin = QSpinBox(body)
         self._history_limit_spin.setRange(HISTORY_LIMIT_MIN, HISTORY_LIMIT_MAX)
         self._history_limit_spin.setSingleStep(50)
         self._history_limit_spin.setMinimumHeight(36)
-        limit_row.addWidget(self._field_label("History limit", history, buddy=self._history_limit_spin))
+        self._history_limit_spin.setFixedWidth(70)
+        limit_row.addWidget(
+            self._field_label("History limit", body, buddy=self._history_limit_spin)
+        )
         limit_row.addStretch()
         limit_row.addWidget(self._history_limit_spin)
         history_layout.addLayout(limit_row)
 
-        layout.addWidget(history)
+        _, _clipboard_panel, clipboard_layout = self._add_section(layout, "Clipboard", body)
 
-        clipboard = self._group_box("Clipboard", body)
-        clipboard_layout = QVBoxLayout(clipboard)
-        clipboard_layout.setContentsMargins(16, 20, 16, 16)
-        clipboard_layout.setSpacing(_FIELD_SPACING)
-
-        self._auto_copy_cb = QCheckBox(
-            "Automatically copy optimized output to clipboard", clipboard
-        )
+        self._auto_copy_cb = QCheckBox("Auto-copy optimized output", body)
         clipboard_layout.addWidget(self._auto_copy_cb)
 
-        project_privacy = self._group_box("Project context", body)
-        project_privacy_layout = QVBoxLayout(project_privacy)
-        project_privacy_layout.setContentsMargins(16, 20, 16, 16)
-        project_privacy_layout.setSpacing(_FIELD_SPACING)
+        self._auto_inject_cb = QCheckBox(
+            "Enable Auto-Inject (paste into the field you were using)", body
+        )
+        clipboard_layout.addWidget(self._auto_inject_cb)
+        clipboard_layout.addWidget(
+            self._hint_label(
+                "Auto-Inject simulates a paste into your previously active window. "
+                "It never injects without your confirmation.",
+                body,
+            )
+        )
+
+        _, _project_panel, project_privacy_layout = self._add_section(
+            layout, "Project context", body
+        )
 
         self._include_project_private_cb = QCheckBox(
-            "Include project context in private mode", project_privacy
-        )
-        project_privacy_layout.addWidget(
-            self._hint_label(
-                "When private session is on, project context is excluded from the "
-                "system prompt by default.",
-                project_privacy,
-            )
+            "Include project context in private mode", body
         )
         project_privacy_layout.addWidget(self._include_project_private_cb)
 
-        layout.addWidget(clipboard)
-        layout.addWidget(project_privacy)
         layout.addStretch()
         return self._scroll_tab(body)
 
@@ -687,67 +923,53 @@ class SettingsDialog(QDialog):
             self._tab_description("Global and in-app keyboard shortcuts", body)
         )
 
-        global_group = self._group_box("Global (system-wide)", body)
-        global_layout = QVBoxLayout(global_group)
-        global_layout.setContentsMargins(16, 20, 16, 16)
-        global_layout.setSpacing(_FIELD_SPACING)
+        _, _global_panel, global_layout = self._add_section(layout, "Global", body)
 
-        self._global_hotkey_edit = self._add_key_edit(
-            global_layout,
-            "Open / hide MetaPrompt (system-wide)",
+        self._global_hotkey_edit = self._shortcut_row(
+            f"Open / hide {APP_NAME}",
             DEFAULT_HOTKEY,
-            global_group,
-        )
-        self._global_collapse_hotkey_edit = self._add_key_edit(
+            body,
             global_layout,
-            "Collapse to chip (global)",
-            DEFAULT_HOTKEY_COLLAPSE,
-            global_group,
-        )
-        global_layout.addWidget(
-            self._hint_label(
+            tooltip=(
                 "Works system-wide. Open hotkey toggles show/hide (expanded or chip). "
-                "Collapse hotkey toggles chip ↔ expanded; when hidden, shows as chip. "
-                "On macOS, grant Accessibility to this app. Restart not required.",
-                global_group,
-            )
+                "On macOS, grant Accessibility to this app."
+            ),
+        )
+        self._global_collapse_hotkey_edit = self._shortcut_row(
+            "Collapse to chip",
+            DEFAULT_HOTKEY_COLLAPSE,
+            body,
+            global_layout,
+            tooltip=(
+                "Works system-wide. Collapse hotkey toggles chip ↔ expanded; "
+                "when hidden, shows as chip."
+            ),
         )
 
-        layout.addWidget(global_group)
+        _, _popup_panel, popup_layout = self._add_section(
+            layout, "When popup is focused", body
+        )
 
-        popup_group = self._group_box("When popup is focused (in-app)", body)
-        popup_layout = QVBoxLayout(popup_group)
-        popup_layout.setContentsMargins(16, 20, 16, 16)
-        popup_layout.setSpacing(_FIELD_SPACING)
-
-        self._collapse_shortcut_edit = self._add_key_edit(
-            popup_layout,
-            "Collapse to chip (when popup focused)",
+        self._collapse_shortcut_edit = self._shortcut_row(
+            "Collapse to chip",
             DEFAULT_SHORTCUT_COLLAPSE,
-            popup_group,
-        )
-        self._hide_shortcut_edit = self._add_key_edit(
+            body,
             popup_layout,
+        )
+        self._hide_shortcut_edit = self._shortcut_row(
             "Hide to tray",
             DEFAULT_SHORTCUT_HIDE_TRAY,
-            popup_group,
-        )
-        self._private_shortcut_edit = self._add_key_edit(
+            body,
             popup_layout,
+        )
+        self._private_shortcut_edit = self._shortcut_row(
             "Toggle private session",
             DEFAULT_SHORTCUT_PRIVATE,
-            popup_group,
-        )
-        popup_layout.addWidget(
-            self._hint_label(
-                "These shortcuts work while the MetaPrompt popup has focus. "
-                f"Rescue off-screen windows with {RESCUE_WINDOW_SHORTCUT} "
-                "(not configurable).",
-                popup_group,
-            )
+            body,
+            popup_layout,
+            tooltip=f"Rescue off-screen windows with {RESCUE_WINDOW_SHORTCUT} (not configurable).",
         )
 
-        layout.addWidget(popup_group)
         layout.addStretch()
         return self._scroll_tab(body)
 
@@ -755,15 +977,16 @@ class SettingsDialog(QDialog):
         body = self._tab_body()
         layout: QVBoxLayout = body._layout  # type: ignore[attr-defined]
         layout.addWidget(self._tab_description("Launch options", body))
-        startup = self._group_box("Windows startup", body)
-        startup_layout = QVBoxLayout(startup)
-        startup_layout.setContentsMargins(16, 20, 16, 16)
-        startup_layout.setSpacing(_FIELD_SPACING)
 
-        self._startup_cb = QCheckBox("Start MetaPrompt with Windows", startup)
-        startup_layout.addWidget(self._startup_cb)
+        self._startup_cb = QCheckBox(f"Start {APP_NAME} with Windows", body)
+        layout.addWidget(self._checkbox_panel(self._startup_cb, body))
 
-        layout.addWidget(startup)
+        self._start_minimized_cb = QCheckBox("Start minimized to tray", body)
+        layout.addWidget(self._checkbox_panel(self._start_minimized_cb, body))
+
+        self._check_updates_cb = QCheckBox("Check for updates on launch", body)
+        layout.addWidget(self._checkbox_panel(self._check_updates_cb, body))
+
         layout.addStretch()
         return self._scroll_tab(body)
 
@@ -773,78 +996,70 @@ class SettingsDialog(QDialog):
         layout.addWidget(
             self._tab_description("Reusable context for optimizations", body)
         )
-        splitter = QSplitter(Qt.Orientation.Horizontal, body)
-        splitter.setObjectName("projectsSplitter")
 
-        list_panel = QWidget(splitter)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(0)
+
+        list_panel = QWidget(body)
+        list_panel.setFixedWidth(180)
         list_layout = QVBoxLayout(list_panel)
-        list_layout.setContentsMargins(0, 0, 8, 0)
+        list_layout.setContentsMargins(0, 0, 0, 0)
         list_layout.setSpacing(8)
 
-        list_header = QHBoxLayout()
-        list_label = QLabel("Projects", list_panel)
-        list_label.setObjectName("fieldLabel")
-        list_header.addWidget(list_label)
-        list_header.addStretch()
-        new_btn = QPushButton("+ New", list_panel)
+        new_btn = QPushButton("+ New project", list_panel)
         new_btn.setObjectName("saveBtn")
+        new_btn.setProperty("dirty", "true")
         new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         new_btn.clicked.connect(self._projects_new)
-        list_header.addWidget(new_btn)
-        list_layout.addLayout(list_header)
+        list_layout.addWidget(new_btn)
 
         self._projects_list = QListWidget(list_panel)
         self._projects_list.setObjectName("projectsList")
         self._projects_list.currentItemChanged.connect(self._on_project_selected)
         list_layout.addWidget(self._projects_list, stretch=1)
 
-        form_panel = QWidget(splitter)
+        form_panel = QWidget(body)
         form_layout = QVBoxLayout(form_panel)
-        form_layout.setContentsMargins(8, 0, 0, 0)
+        form_layout.setContentsMargins(0, 0, 0, 0)
         form_layout.setSpacing(_FIELD_SPACING)
 
-        form_group = self._group_box("Project details", form_panel)
-        fields = QVBoxLayout(form_group)
-        fields.setContentsMargins(16, 20, 16, 16)
-        fields.setSpacing(_FIELD_SPACING)
-
-        self._project_name_input = QLineEdit(form_group)
+        self._project_name_input = QLineEdit(form_panel)
         self._project_name_input.setMinimumHeight(36)
         self._project_name_input.textChanged.connect(self._sync_project_list_preview)
-        fields.addWidget(
-            self._field_label("Name", form_group, buddy=self._project_name_input)
+        form_layout.addWidget(
+            self._field_label("Name", form_panel, buddy=self._project_name_input)
         )
-        fields.addWidget(self._project_name_input)
+        form_layout.addWidget(self._project_name_input)
 
-        self._project_tags = TagInputWidget(form_group)
+        self._project_tags = TagInputWidget(form_panel)
         self._project_tags.tags_changed.connect(self._sync_project_list_preview)
-        fields.addWidget(self._field_label("Tech stack", form_group))
-        fields.addWidget(self._project_tags)
+        form_layout.addWidget(self._field_label("Tech stack", form_panel))
+        form_layout.addWidget(self._project_tags)
 
-        self._project_type_combo = QComboBox(form_group)
+        self._project_type_combo = QComboBox(form_panel)
         self._project_type_combo.setMinimumHeight(36)
         self._project_type_combo.addItem("(none)", "")
         for ptype in PROJECT_TYPES:
             if ptype:
                 self._project_type_combo.addItem(ptype, ptype)
-        fields.addWidget(
-            self._field_label("Project type", form_group, buddy=self._project_type_combo)
+        self._project_type_combo.currentIndexChanged.connect(self._sync_project_list_preview)
+        form_layout.addWidget(
+            self._field_label("Project type", form_panel, buddy=self._project_type_combo)
         )
-        fields.addWidget(self._project_type_combo)
+        form_layout.addWidget(self._project_type_combo)
 
-        self._project_conventions = QTextEdit(form_group)
-        self._project_conventions.setPlaceholderText("How we do things here…")
+        self._project_conventions = QTextEdit(form_panel)
+        self._project_conventions.setPlaceholderText("How this project does things...")
         self._project_conventions.setMinimumHeight(72)
-        fields.addWidget(self._field_label("Conventions", form_group))
-        fields.addWidget(self._project_conventions)
+        form_layout.addWidget(self._field_label("Conventions", form_panel))
+        form_layout.addWidget(self._project_conventions)
 
-        self._project_notes = QTextEdit(form_group)
+        self._project_notes = QTextEdit(form_panel)
         self._project_notes.setPlaceholderText("Additional notes…")
         self._project_notes.setMinimumHeight(72)
-        fields.addWidget(self._field_label("Notes", form_group))
-        fields.addWidget(self._project_notes)
-
-        form_layout.addWidget(form_group)
+        form_layout.addWidget(self._field_label("Notes", form_panel))
+        form_layout.addWidget(self._project_notes)
 
         self._projects_error = QLabel("", form_panel)
         self._projects_error.setObjectName("errorLabel")
@@ -867,67 +1082,67 @@ class SettingsDialog(QDialog):
 
         save_project_btn = QPushButton("Save project", form_panel)
         save_project_btn.setObjectName("saveBtn")
+        save_project_btn.setProperty("dirty", "true")
         save_project_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_project_btn.clicked.connect(self._projects_save)
         btn_row.addWidget(save_project_btn)
         form_layout.addLayout(btn_row)
         form_layout.addStretch()
 
-        splitter.addWidget(list_panel)
-        splitter.addWidget(form_panel)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-        layout.addWidget(splitter)
+        grid.addWidget(list_panel, 0, 0)
+        grid.addWidget(form_panel, 0, 1)
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid)
 
         self._reload_projects_list()
         return self._scroll_tab(body)
 
-    def _format_project_list_label(
-        self,
-        *,
-        name: str,
-        tech_stack: list[str] | None = None,
-        last_used: str = "",
-    ) -> str:
-        display_name = name.strip() or "Project"
-        lines = [display_name]
-        tags = [t.strip() for t in (tech_stack or []) if str(t).strip()]
-        if tags:
-            lines.append(", ".join(tags))
-        if last_used:
-            lines.append(f"Last used {last_used[:10]}")
-        return "\n".join(lines)
-
-    def _format_project_list_label_from_project(self, project: dict[str, Any]) -> str:
-        return self._format_project_list_label(
-            name=str(project.get("name") or project.get("id") or "Project"),
-            tech_stack=list(project.get("tech_stack") or []),
-            last_used=str(project.get("last_used") or ""),
-        )
+    def _project_type_label(self, project_type: str) -> str:
+        return (project_type or "").strip()
 
     def _sync_project_list_preview(self) -> None:
         current = self._projects_list.currentItem()
         if current is None:
             return
-        current.setText(
-            self._format_project_list_label(
-                name=self._project_name_input.text(),
-                tech_stack=self._project_tags.tags(),
-            )
+        project_id = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        widget = self._project_item_widgets.get(project_id)
+        if widget is None:
+            return
+        widget.update_labels(
+            name=self._project_name_input.text(),
+            project_type=str(self._project_type_combo.currentText() or ""),
         )
+
+    def _update_project_list_selection_styles(self) -> None:
+        current = self._projects_list.currentItem()
+        current_id = str(current.data(Qt.ItemDataRole.UserRole) or "") if current else ""
+        for project_id, widget in self._project_item_widgets.items():
+            widget.set_active(project_id == current_id)
 
     def _reload_projects_list(self, *, select_id: str | None = None) -> None:
         self._projects_list.blockSignals(True)
         self._projects_list.clear()
+        self._project_item_widgets.clear()
         for project in list_projects():
-            item = QListWidgetItem(self._format_project_list_label_from_project(project))
-            item.setData(Qt.ItemDataRole.UserRole, str(project.get("id")))
+            project_id = str(project.get("id"))
+            widget = ProjectListItemWidget(
+                name=str(project.get("name") or project.get("id") or "Project"),
+                project_type=self._project_type_label(str(project.get("project_type") or "")),
+                parent=self._projects_list,
+            )
+            self._project_item_widgets[project_id] = widget
+            item = QListWidgetItem(self._projects_list)
+            item.setData(Qt.ItemDataRole.UserRole, project_id)
+            item.setSizeHint(widget.sizeHint())
             self._projects_list.addItem(item)
-            if select_id and str(project.get("id")) == select_id:
+            self._projects_list.setItemWidget(item, widget)
+            if select_id and project_id == select_id:
                 self._projects_list.setCurrentItem(item)
         self._projects_list.blockSignals(False)
         if select_id is None and self._projects_list.count() > 0:
             self._projects_list.setCurrentRow(0)
+        self._update_project_list_selection_styles()
 
     def _clear_project_form(self) -> None:
         self._project_name_input.clear()
@@ -956,6 +1171,7 @@ class SettingsDialog(QDialog):
         self._projects_error.hide()
 
     def _on_project_selected(self, current: QListWidgetItem | None, _previous) -> None:  # noqa: ANN001
+        self._update_project_list_selection_styles()
         if current is None:
             return
         project_id = str(current.data(Qt.ItemDataRole.UserRole) or "")
@@ -966,6 +1182,7 @@ class SettingsDialog(QDialog):
         self._selected_project_id = None
         self._projects_is_new = True
         self._projects_list.clearSelection()
+        self._update_project_list_selection_styles()
         self._clear_project_form()
         self._project_delete_btn.setEnabled(False)
         self._project_name_input.setFocus()
@@ -1026,18 +1243,89 @@ class SettingsDialog(QDialog):
         QWidget.setTabOrder(self._provider_combo, self._api_key_input)
         QWidget.setTabOrder(self._api_key_input, self._mode_combo)
         QWidget.setTabOrder(self._mode_combo, self._persist_draft_cb)
-        QWidget.setTabOrder(self._persist_draft_cb, self._model_input)
+        QWidget.setTabOrder(self._persist_draft_cb, self._voice_enabled_cb)
+        QWidget.setTabOrder(self._voice_enabled_cb, self._voice_local_radio)
+        QWidget.setTabOrder(self._voice_local_radio, self._voice_cloud_radio)
+        QWidget.setTabOrder(self._voice_cloud_radio, self._voice_ptt_radio)
+        QWidget.setTabOrder(self._voice_ptt_radio, self._voice_toggle_radio)
+        QWidget.setTabOrder(self._voice_toggle_radio, self._voice_model_combo)
+        QWidget.setTabOrder(self._voice_model_combo, self._voice_toggle_max_spin)
+        QWidget.setTabOrder(self._voice_toggle_max_spin, self._voice_ptt_shortcut_edit)
+        QWidget.setTabOrder(self._voice_ptt_shortcut_edit, self._model_input)
         QWidget.setTabOrder(self._model_input, self._model_fast_input)
         QWidget.setTabOrder(self._model_fast_input, self._save_history_cb)
         QWidget.setTabOrder(self._save_history_cb, self._exclude_sensitive_cb)
         QWidget.setTabOrder(self._exclude_sensitive_cb, self._history_limit_spin)
         QWidget.setTabOrder(self._history_limit_spin, self._auto_copy_cb)
-        QWidget.setTabOrder(self._auto_copy_cb, self._global_hotkey_edit)
+        QWidget.setTabOrder(self._auto_copy_cb, self._auto_inject_cb)
+        QWidget.setTabOrder(self._auto_inject_cb, self._global_hotkey_edit)
         QWidget.setTabOrder(self._global_hotkey_edit, self._global_collapse_hotkey_edit)
         QWidget.setTabOrder(self._global_collapse_hotkey_edit, self._collapse_shortcut_edit)
         QWidget.setTabOrder(self._collapse_shortcut_edit, self._hide_shortcut_edit)
         QWidget.setTabOrder(self._hide_shortcut_edit, self._private_shortcut_edit)
         QWidget.setTabOrder(self._private_shortcut_edit, self._startup_cb)
+        QWidget.setTabOrder(self._startup_cb, self._start_minimized_cb)
+        QWidget.setTabOrder(self._start_minimized_cb, self._check_updates_cb)
+
+    def _reset_model_field(self, field: str) -> None:
+        provider = str(self._provider_combo.currentData() or "gemini")
+        preset = PROVIDER_PRESETS.get(provider, PROVIDER_PRESETS["gemini"])
+        if field == "model":
+            self._model_input.setText(str(preset["model"]))
+        else:
+            self._model_fast_input.setText(str(preset["model_fast"]))
+        self._update_dirty_state()
+
+    def _connect_dirty_tracking(self) -> None:
+        widgets: list[QWidget] = [
+            self._provider_combo,
+            self._api_key_input,
+            self._mode_combo,
+            self._persist_draft_cb,
+            self._model_input,
+            self._model_fast_input,
+            self._save_history_cb,
+            self._exclude_sensitive_cb,
+            self._history_limit_spin,
+            self._auto_copy_cb,
+            self._auto_inject_cb,
+            self._include_project_private_cb,
+            self._global_hotkey_edit,
+            self._global_collapse_hotkey_edit,
+            self._collapse_shortcut_edit,
+            self._hide_shortcut_edit,
+            self._private_shortcut_edit,
+            self._startup_cb,
+            self._start_minimized_cb,
+            self._check_updates_cb,
+            self._voice_enabled_cb,
+            self._voice_local_radio,
+            self._voice_cloud_radio,
+            self._voice_ptt_radio,
+            self._voice_toggle_radio,
+            self._voice_model_combo,
+            self._voice_toggle_max_spin,
+            self._voice_ptt_shortcut_edit,
+        ]
+        for widget in widgets:
+            if isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(self._update_dirty_state)
+            elif isinstance(widget, QLineEdit):
+                widget.textChanged.connect(self._update_dirty_state)
+            elif isinstance(widget, QCheckBox):
+                widget.toggled.connect(self._update_dirty_state)
+            elif isinstance(widget, QSpinBox):
+                widget.valueChanged.connect(self._update_dirty_state)
+            elif isinstance(widget, QKeySequenceEdit):
+                widget.keySequenceChanged.connect(self._update_dirty_state)
+            elif isinstance(widget, QRadioButton):
+                widget.toggled.connect(self._update_dirty_state)
+
+    def _update_dirty_state(self) -> None:
+        dirty = self._first_run or self._collect_values() != self._snapshot
+        self._save_btn.setProperty("dirty", "true" if dirty else "false")
+        self._save_btn.style().unpolish(self._save_btn)
+        self._save_btn.style().polish(self._save_btn)
 
     def _load_from_config(self) -> None:
         cfg = load_config()
@@ -1071,6 +1359,8 @@ class SettingsDialog(QDialog):
         )
 
         self._startup_cb.setChecked(is_start_with_windows_enabled())
+        self._start_minimized_cb.setChecked(bool(cfg.get("start_minimized_to_tray", True)))
+        self._check_updates_cb.setChecked(bool(cfg.get("check_updates_on_launch", False)))
 
         self._collapse_shortcut_edit.setKeySequence(
             QKeySequence(str(cfg.get("shortcut_collapse") or DEFAULT_SHORTCUT_COLLAPSE))
@@ -1082,12 +1372,36 @@ class SettingsDialog(QDialog):
             QKeySequence(str(cfg.get("shortcut_private") or DEFAULT_SHORTCUT_PRIVATE))
         )
         self._auto_copy_cb.setChecked(bool(cfg.get("auto_copy_clipboard", True)))
+        self._auto_inject_cb.setChecked(bool(cfg.get("auto_inject_enabled", False)))
         self._include_project_private_cb.setChecked(
             bool(cfg.get("include_project_context_in_private", False))
         )
 
+        self._voice_enabled_cb.setChecked(bool(cfg.get("voice_enabled", False)))
+        transcription_mode = str(cfg.get("voice_transcription_mode") or "local").lower()
+        self._voice_local_radio.setChecked(transcription_mode != "cloud")
+        self._voice_cloud_radio.setChecked(transcription_mode == "cloud")
+
+        recording_mode = str(cfg.get("voice_recording_mode") or "push_to_talk").lower()
+        self._voice_ptt_radio.setChecked(recording_mode != "toggle")
+        self._voice_toggle_radio.setChecked(recording_mode == "toggle")
+
+        model_size = str(cfg.get("voice_model_size") or "base").lower()
+        model_idx = self._voice_model_combo.findData(model_size)
+        self._voice_model_combo.setCurrentIndex(model_idx if model_idx >= 0 else 1)
+
+        self._voice_toggle_max_spin.setValue(int(cfg.get("voice_toggle_max_seconds") or 60))
+        self._voice_ptt_shortcut_edit.setKeySequence(
+            QKeySequence(str(cfg.get("voice_ptt_shortcut") or DEFAULT_VOICE_PTT_SHORTCUT))
+        )
+        self._update_voice_cloud_state()
+
         if self._projects_list.count() == 0:
             self._projects_new()
+
+    def _update_voice_cloud_state(self) -> None:
+        self._voice_cloud_radio.setEnabled(False)
+        self._voice_cloud_note.show()
 
     def _on_provider_changed(self, _index: int) -> None:
         if self._provider_changing:
@@ -1098,6 +1412,7 @@ class SettingsDialog(QDialog):
         preset = PROVIDER_PRESETS[str(provider)]
         self._model_input.setText(preset["model"])
         self._model_fast_input.setText(preset["model_fast"])
+        self._update_dirty_state()
 
     def _collect_values(self) -> dict[str, Any]:
         provider = str(self._provider_combo.currentData() or "gemini")
@@ -1119,6 +1434,8 @@ class SettingsDialog(QDialog):
             exclude_sensitive=self._exclude_sensitive_cb.isChecked(),
             history_limit=self._history_limit_spin.value(),
             start_with_windows=self._startup_cb.isChecked(),
+            start_minimized_to_tray=self._start_minimized_cb.isChecked(),
+            check_updates_on_launch=self._check_updates_cb.isChecked(),
             shortcut_collapse=self._collapse_shortcut_edit.keySequence().toString(
                 QKeySequence.SequenceFormat.PortableText
             ),
@@ -1129,7 +1446,20 @@ class SettingsDialog(QDialog):
                 QKeySequence.SequenceFormat.PortableText
             ),
             auto_copy_clipboard=self._auto_copy_cb.isChecked(),
+            auto_inject_enabled=self._auto_inject_cb.isChecked(),
             include_project_context_in_private=self._include_project_private_cb.isChecked(),
+            voice_enabled=self._voice_enabled_cb.isChecked(),
+            voice_transcription_mode=(
+                "cloud" if self._voice_cloud_radio.isChecked() else "local"
+            ),
+            voice_recording_mode=(
+                "toggle" if self._voice_toggle_radio.isChecked() else "push_to_talk"
+            ),
+            voice_model_size=str(self._voice_model_combo.currentData() or "base"),
+            voice_toggle_max_seconds=self._voice_toggle_max_spin.value(),
+            voice_ptt_shortcut=self._voice_ptt_shortcut_edit.keySequence().toString(
+                QKeySequence.SequenceFormat.PortableText
+            ),
         )
 
     def _on_reset_window_position_clicked(self) -> None:

@@ -1,5 +1,5 @@
 """
-Central logging setup for MetaPrompt.
+Central logging setup for Opti.
 
 Redacts API keys from log records before they reach handlers.
 """
@@ -12,10 +12,10 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from config import APP_DIR
+from paths import ensure_data_dir, get_data_dir
 
-_LOG_DIR = APP_DIR / "logs"
-_LOG_FILE = _LOG_DIR / "metaprompt.log"
+_LOG_DIR = get_data_dir() / "logs"
+_LOG_FILE = _LOG_DIR / "opti.log"
 
 # Common API key shapes (Gemini, Groq, OpenRouter, Anthropic, etc.)
 _KEY_PATTERNS = (

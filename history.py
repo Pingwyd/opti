@@ -14,9 +14,10 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from config import APP_DIR, load_config
+from config import load_config
+from paths import get_data_dir
 
-HISTORY_PATH = APP_DIR / "history.json"
+HISTORY_PATH = get_data_dir() / "history.json"
 
 _DEFAULT_SENSITIVE_KEYWORDS = ("password", "secret", "api_key", "api key", "token", "credential")
 
@@ -232,3 +233,13 @@ def distinct_project_names() -> list[str]:
 
 def history_file_path() -> Path:
     return HISTORY_PATH
+
+def delete_entry(entry_id: str) -> bool:
+    """Delete an entry by id. Returns True if deleted."""
+    entries = _read_all()
+    filtered = [e for e in entries if e.get("id") != entry_id]
+    if len(filtered) == len(entries):
+        return False
+    _write_all(filtered)
+    return True
+

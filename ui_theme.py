@@ -1,5 +1,5 @@
 """
-MetaPrompt design tokens and Qt Style Sheet (QSS) builders.
+Opti design tokens and Qt Style Sheet (QSS) builders.
 
 Tailwind reference (docs only, not used at runtime):
 | Token              | PyQt value              | Tailwind equivalent        |
@@ -33,6 +33,7 @@ DESIGN_TOKENS: dict[str, Any] = {
         "bg_translucent": "rgba(20, 20, 22, 0.88)",
         "text": "#f5f5f7",
         "text_muted": "#9d9da8",
+        "text_secondary": "#b4b4be",
         "accent": "#F08060",
         "accent_hover": "#f59578",
         "accent_muted": "rgba(240, 128, 96, 0.14)",
@@ -80,7 +81,7 @@ L = DESIGN_TOKENS["layout"]
 
 
 def popup_stylesheet() -> str:
-    """QSS for the main MetaPrompt popup window."""
+    """QSS for the main Opti popup window."""
     return f"""
         QWidget {{
             font-family: {F["family"]};
@@ -194,6 +195,46 @@ def popup_stylesheet() -> str:
             font-size: {F["size_base"]}px;
             min-width: 18px;
         }}
+        QPushButton#voiceMicBtn {{
+            background: transparent;
+            color: {C["text_muted"]};
+            border: 1px solid {C["border_subtle"]};
+            border-radius: 14px;
+            padding: 0;
+            font-size: 15px;
+            min-width: 28px;
+            max-width: 28px;
+            min-height: 28px;
+            max-height: 28px;
+        }}
+        QPushButton#voiceMicBtn:hover {{
+            color: {C["text"]};
+            border-color: {C["border_hover"]};
+            background: rgba(255, 255, 255, 0.06);
+        }}
+        QPushButton#voiceMicBtn:disabled {{
+            color: rgba(157, 157, 168, 0.45);
+            border-color: rgba(255, 255, 255, 0.05);
+        }}
+        QPushButton#voiceMicBtn[recording="true"] {{
+            color: {C["danger"]};
+            border-color: rgba(255, 123, 123, 0.55);
+            background: rgba(255, 123, 123, 0.14);
+        }}
+        QPushButton#voiceMicBtn[transcribing="true"] {{
+            color: {C["accent"]};
+            border-color: {C["accent_border"]};
+            background: {C["accent_muted"]};
+        }}
+        QWidget#audioLevelMeter {{
+            background: transparent;
+        }}
+        QLabel#voiceStatusLabel {{
+            color: {C["danger"]};
+            font-size: {F["size_xs"]}px;
+            padding: 0;
+            margin: 0;
+        }}
         QLabel#statusLabel {{
             color: {C["success"]};
             font-size: {F["size_sm"]}px;
@@ -209,6 +250,27 @@ def popup_stylesheet() -> str:
         }}
         QPushButton#ghostBtn:hover {{
             color: {C["text"]};
+            background: rgba(255, 255, 255, 0.06);
+        }}
+        QWidget#injectRow {{
+            background: transparent;
+        }}
+        QLabel#injectLabel {{
+            color: {C["text_muted"]};
+            font-size: {F["size_sm"]}px;
+        }}
+        QPushButton#injectBtn {{
+            background: transparent;
+            color: {C["text_muted"]};
+            border: 1px solid {C["border_subtle"]};
+            border-radius: {R["button"]}px;
+            padding: 5px 12px;
+            font-size: {F["size_sm"]}px;
+            font-weight: 500;
+        }}
+        QPushButton#injectBtn:hover {{
+            color: {C["text"]};
+            border-color: {C["border_hover"]};
             background: rgba(255, 255, 255, 0.06);
         }}
         QTextEdit#resultText {{
@@ -349,6 +411,36 @@ def history_stylesheet() -> str:
         QFrame#searchBar:focus-within {{
             border-color: {C["border_focus"]};
         }}
+        QFrame#filtersBar {{
+            background: {C["bg_soft"]};
+            border: 1px solid {C["border_subtle"]};
+            border-radius: {R["input"]}px;
+        }}
+        QFrame#filterSeparator {{
+            background: {C["border_subtle"]};
+            max-width: 1px;
+            margin: 4px 4px;
+        }}
+        QComboBox#historyProjectFilter {{
+            background: transparent;
+            border: 1px solid {C["border_subtle"]};
+            border-radius: {R["button"]}px;
+            color: {C["text"]};
+            padding: 6px 12px;
+            font-size: {F["size_sm"]}px;
+        }}
+        QComboBox#historyProjectFilter:focus {{
+            border-color: {C["border_focus"]};
+        }}
+        QComboBox#historyProjectFilter::drop-down {{
+            border: none;
+            width: 24px;
+        }}
+        QComboBox#historyProjectFilter QAbstractItemView {{
+            background: {C["bg_soft"]};
+            color: {C["text"]};
+            selection-background-color: {C["accent_muted"]};
+        }}
         QLineEdit#historySearch {{
             background: transparent;
             border: none;
@@ -372,9 +464,9 @@ def history_stylesheet() -> str:
             background: rgba(255, 255, 255, 0.03);
         }}
         QPushButton#filterPill:checked {{
-            background: rgba(255, 255, 255, 0.04);
+            background: {C["accent_muted"]};
             border-color: {C["accent_border"]};
-            color: {C["text"]};
+            color: {C["accent"]};
         }}
         QPushButton#filterChip {{
             background: rgba(255, 255, 255, 0.06);
@@ -449,12 +541,22 @@ def history_stylesheet() -> str:
             background: rgba(255, 255, 255, 0.06);
         }}
         QTableWidget#historyTable::item:selected {{
-            background: rgba(240, 128, 96, 0.10);
+            background: rgba(240, 128, 96, 0.18);
             color: {C["text"]};
             border-left: 3px solid {C["accent"]};
         }}
         QTableWidget#historyTable::item:selected:hover {{
-            background: rgba(240, 128, 96, 0.14);
+            background: rgba(240, 128, 96, 0.22);
+        }}
+        QLabel#modelName {{
+            color: {C["text_muted"]};
+            font-size: {F["size_sm"]}px;
+        }}
+        QLabel#statusCheck {{
+            color: {C["success"]};
+            font-size: 15px;
+            font-weight: 700;
+            min-width: 20px;
         }}
         QHeaderView::section {{
             background: {C["bg_soft"]};
@@ -481,7 +583,7 @@ def history_stylesheet() -> str:
             border-radius: {R["input"]}px;
             color: {C["text"]};
             font-size: 13px;
-            padding: 10px 12px;
+            padding: 8px 10px;
             selection-background-color: {C["accent_muted"]};
         }}
         QTextEdit#detailOutput {{
@@ -490,23 +592,7 @@ def history_stylesheet() -> str:
         QTextEdit#detailInput:focus, QTextEdit#detailOutput:focus {{
             border-color: {C["border_focus"]};
         }}
-        QPushButton#detailBtn {{
-            background: rgba(255, 255, 255, 0.05);
-            color: {C["text"]};
-            border: 1px solid {C["border"]};
-            border-radius: {R["button"]}px;
-            padding: 8px 14px;
-            font-size: {F["size_sm"]}px;
-        }}
-        QPushButton#detailBtn:hover:enabled {{
-            border-color: {C["accent_border"]};
-            color: {C["accent"]};
-        }}
-        QPushButton#detailBtn:disabled {{
-            color: rgba(157, 157, 168, 0.45);
-            border-color: rgba(255, 255, 255, 0.05);
-        }}
-        QPushButton#detailBtnAccent {{
+        QPushButton#detailBtnPrimary {{
             background: {C["accent"]};
             color: #1a1a1a;
             border: none;
@@ -515,12 +601,46 @@ def history_stylesheet() -> str:
             font-size: {F["size_sm"]}px;
             font-weight: 600;
         }}
-        QPushButton#detailBtnAccent:hover:enabled {{
+        QPushButton#detailBtnPrimary:hover:enabled {{
             background: {C["accent_hover"]};
         }}
-        QPushButton#detailBtnAccent:disabled {{
+        QPushButton#detailBtnPrimary:disabled {{
             background: rgba(240, 128, 96, 0.35);
             color: rgba(26, 26, 26, 0.5);
+        }}
+        QPushButton#detailBtnGhost {{
+            background: transparent;
+            color: {C["text"]};
+            border: 1px solid {C["border"]};
+            border-radius: {R["button"]}px;
+            padding: 8px 14px;
+            font-size: {F["size_sm"]}px;
+        }}
+        QPushButton#detailBtnGhost:hover:enabled {{
+            border-color: {C["accent_border"]};
+            color: {C["accent"]};
+            background: rgba(255, 255, 255, 0.03);
+        }}
+        QPushButton#detailBtnGhost:disabled {{
+            color: rgba(157, 157, 168, 0.45);
+            border-color: rgba(255, 255, 255, 0.05);
+        }}
+        QPushButton#detailBtnIcon {{
+            background: transparent;
+            color: {C["text_muted"]};
+            border: 1px solid transparent;
+            border-radius: {R["button"]}px;
+            font-size: 18px;
+            font-weight: 500;
+            padding: 0;
+        }}
+        QPushButton#detailBtnIcon:hover:enabled {{
+            color: {C["text"]};
+            background: rgba(255, 255, 255, 0.06);
+            border-color: {C["border_subtle"]};
+        }}
+        QPushButton#detailBtnIcon:disabled {{
+            color: rgba(157, 157, 168, 0.45);
         }}
         QCheckBox {{
             color: {C["text_muted"]};
@@ -554,18 +674,58 @@ def settings_stylesheet() -> str:
             font-family: {F["family"]};
         }}
         QLabel#settingsTitle {{
-            color: {C["text"]};
-            font-size: {F["size_lg"]}px;
-            font-weight: 600;
+            color: #ffffff;
+            font-size: 20px;
+            font-weight: 700;
+            letter-spacing: -0.3px;
+            padding-bottom: 2px;
         }}
         QLabel#settingsSubtitle {{
             color: {C["text_muted"]};
             font-size: {F["size_sm"]}px;
+            line-height: 1.4;
         }}
         QLabel#tabDescription {{
             color: {C["text_muted"]};
             font-size: {F["size_sm"]}px;
-            padding-bottom: 4px;
+            font-weight: 500;
+            padding-bottom: 6px;
+            margin-bottom: 4px;
+        }}
+        QLabel#sectionHeader {{
+            color: {C["text_secondary"]};
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            padding-top: 10px;
+            margin-bottom: 2px;
+        }}
+        QLabel#shortcutLabel {{
+            color: {C["text"]};
+            font-size: 13px;
+            font-weight: 500;
+        }}
+        QLabel#infoIcon {{
+            color: {C["text_muted"]};
+            font-size: 13px;
+            min-width: 14px;
+            max-width: 14px;
+        }}
+        QLabel#projectItemName {{
+            color: {C["text"]};
+            font-size: 13px;
+            font-weight: 600;
+        }}
+        QLabel#projectItemName[active="true"] {{
+            color: {C["accent"]};
+        }}
+        QLabel#projectItemType {{
+            color: {C["text_muted"]};
+            font-size: 11px;
+        }}
+        QLabel#projectItemType[active="true"] {{
+            color: {C["text_secondary"]};
         }}
         QLabel#sectionTitle {{
             color: {C["text"]};
@@ -585,53 +745,130 @@ def settings_stylesheet() -> str:
         QLabel#errorLabel {{
             color: {C["danger"]};
             font-size: {F["size_sm"]}px;
+            font-weight: 500;
         }}
-        QFrame#settingsCard {{
+        QFrame#settingsPanel {{
             background: {C["bg_soft"]};
             border: 1px solid {C["border_subtle"]};
             border-radius: {R["panel"]}px;
         }}
+        QFrame#settingsPanel:hover {{
+            border-color: {C["border_hover"]};
+        }}
+        QFrame#tagBox {{
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid {C["border"]};
+            border-radius: {R["input"]}px;
+            padding: 4px;
+        }}
+        QFrame#tagBox:focus-within {{
+            border-color: {C["border_focus"]};
+        }}
+        QLineEdit#tagInlineInput {{
+            background: transparent;
+            border: none;
+            color: {C["text"]};
+            padding: 4px 6px;
+            font-size: {F["size_sm"]}px;
+            min-height: 24px;
+        }}
+        QWidget#tagChipWidget {{
+            background: {C["accent_muted"]};
+            border: 1px solid {C["accent_border"]};
+            border-radius: 12px;
+        }}
+        QFrame#projectListCard {{
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid {C["border_subtle"]};
+            border-radius: {R["input"]}px;
+        }}
+        QFrame#projectListCard:hover {{
+            background: rgba(255, 255, 255, 0.06);
+            border-color: {C["border_hover"]};
+        }}
+        QFrame#projectListCard[active="true"] {{
+            background: {C["accent_muted"]};
+            border: 1px solid {C["accent_border"]};
+        }}
         QLineEdit, QSpinBox {{
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.04);
             border: 1px solid {C["border"]};
             border-radius: {R["input"]}px;
             color: {C["text"]};
             padding: 8px 12px;
             font-size: 13px;
-            min-height: 18px;
+            min-height: 20px;
+            selection-background-color: {C["accent_muted"]};
+        }}
+        QLineEdit:hover, QSpinBox:hover {{
+            border-color: {C["border_hover"]};
+            background: rgba(255, 255, 255, 0.06);
         }}
         QLineEdit:focus, QSpinBox:focus {{
             border-color: {C["border_focus"]};
+            background: rgba(240, 128, 96, 0.05);
         }}
         QSpinBox::up-button, QSpinBox::down-button {{
             background: rgba(255, 255, 255, 0.06);
             border: none;
             width: 18px;
+            border-radius: 3px;
+            margin: 2px;
+        }}
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+            background: rgba(255, 255, 255, 0.12);
         }}
         QComboBox {{
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.04);
             border: 1px solid {C["border"]};
             border-radius: {R["input"]}px;
             color: {C["text"]};
             padding: 8px 12px;
             font-size: 13px;
+            min-height: 20px;
+        }}
+        QComboBox:hover {{
+            border-color: {C["border_hover"]};
+            background: rgba(255, 255, 255, 0.06);
         }}
         QComboBox:focus {{
             border-color: {C["border_focus"]};
+            background: rgba(240, 128, 96, 0.05);
         }}
         QComboBox::drop-down {{
-            border: none;
+            subcontrol-origin: padding;
+            subcontrol-position: center right;
             width: 24px;
+            border: none;
+            background: transparent;
+        }}
+        QComboBox::down-arrow {{
+            image: none;
+            width: 0px;
+            height: 0px;
+            border-left: 4px solid transparent;
+            border-right: 4px solid transparent;
+            border-top: 5px solid {C["text_muted"]};
+            margin-right: 10px;
+        }}
+        QComboBox:hover::down-arrow {{
+            border-top-color: {C["text"]};
         }}
         QComboBox QAbstractItemView {{
             background: {C["bg_soft"]};
+            border: 1px solid {C["border"]};
+            border-radius: {R["input"]}px;
             color: {C["text"]};
+            padding: 4px;
+            outline: none;
             selection-background-color: {C["accent_muted"]};
+            selection-color: {C["accent"]};
         }}
         QCheckBox {{
-            color: {C["text_muted"]};
+            color: {C["text"]};
             font-size: {F["size_sm"]}px;
-            spacing: 8px;
+            spacing: 10px;
+            padding: 2px 0;
         }}
         QCheckBox::indicator {{
             width: 16px;
@@ -640,33 +877,64 @@ def settings_stylesheet() -> str:
             border: 1px solid {C["border"]};
             background: rgba(255, 255, 255, 0.04);
         }}
+        QCheckBox::indicator:hover {{
+            border-color: {C["border_focus"]};
+            background: rgba(255, 255, 255, 0.08);
+        }}
         QCheckBox::indicator:checked {{
-            background: {C["accent"]};
+            background-color: {C["accent"]};
             border-color: {C["accent"]};
+            image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23121214' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='20 6 9 17 4 12'></polyline></svg>");
         }}
         QPushButton#saveBtn {{
-            background: {C["accent"]};
-            color: #1a1a1a;
             border: none;
             border-radius: {R["input"]}px;
-            padding: 10px 20px;
+            padding: 9px 20px;
             font-size: 13px;
             font-weight: 600;
+            min-height: 20px;
         }}
-        QPushButton#saveBtn:hover {{
+        QPushButton#saveBtn[dirty="false"] {{
+            background: rgba(255, 255, 255, 0.07);
+            color: {C["text_muted"]};
+        }}
+        QPushButton#saveBtn[dirty="false"]:hover {{
+            background: rgba(255, 255, 255, 0.10);
+            color: {C["text"]};
+        }}
+        QPushButton#saveBtn[dirty="true"] {{
+            background: {C["accent"]};
+            color: #121214;
+        }}
+        QPushButton#saveBtn[dirty="true"]:hover {{
             background: {C["accent_hover"]};
         }}
+        QPushButton#linkBtn {{
+            background: transparent;
+            color: {C["text_muted"]};
+            border: none;
+            font-size: 12px;
+            font-weight: 500;
+            padding: 0;
+            text-align: right;
+        }}
+        QPushButton#linkBtn:hover {{
+            color: {C["accent"]};
+        }}
         QPushButton#cancelBtn {{
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.04);
             color: {C["text"]};
             border: 1px solid {C["border"]};
             border-radius: {R["input"]}px;
-            padding: 10px 20px;
+            padding: 9px 18px;
             font-size: 13px;
+            font-weight: 500;
+            min-height: 20px;
         }}
         QPushButton#cancelBtn:hover {{
-            border-color: {C["accent_border"]};
+            border-color: {C["border_focus"]};
             color: {C["accent"]};
+            background: rgba(240, 128, 96, 0.08);
         }}
         QScrollArea#settingsScroll {{
             background: transparent;
@@ -676,17 +944,25 @@ def settings_stylesheet() -> str:
             background: transparent;
         }}
         QScrollBar:vertical {{
+            border: none;
             background: transparent;
-            width: 10px;
-            margin: 0;
+            width: 6px;
+            margin: 0px;
         }}
         QScrollBar::handle:vertical {{
-            background: rgba(255, 255, 255, 0.12);
-            border-radius: 5px;
+            background: rgba(255, 255, 255, 0.16);
+            border-radius: 3px;
             min-height: 24px;
         }}
+        QScrollBar::handle:vertical:hover {{
+            background: rgba(240, 128, 96, 0.50);
+        }}
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-            height: 0;
+            height: 0px;
+            background: none;
+        }}
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+            background: none;
         }}
         QTabWidget#settingsTabs {{
             background: transparent;
@@ -694,29 +970,35 @@ def settings_stylesheet() -> str:
         QTabWidget#settingsTabs::pane {{
             border: none;
             background: transparent;
-            top: -1px;
+            top: 0px;
         }}
-        QTabWidget#settingsTabs > QTabBar::tab {{
+        QTabBar {{
+            background: transparent;
+            border: none;
+        }}
+        QTabBar::tab {{
             background: rgba(255, 255, 255, 0.04);
             color: {C["text_muted"]};
             border: 1px solid {C["border_subtle"]};
-            border-bottom: none;
-            border-top-left-radius: {R["button"]}px;
-            border-top-right-radius: {R["button"]}px;
-            padding: 8px 16px;
-            margin-right: 4px;
+            border-radius: 8px;
+            padding: 7px 16px;
+            margin-right: 6px;
+            margin-top: 4px;
+            margin-bottom: 8px;
             min-height: 20px;
-            font-size: {F["size_sm"]}px;
-            font-weight: 500;
+            font-size: 13px;
+            font-weight: 600;
         }}
-        QTabWidget#settingsTabs > QTabBar::tab:selected {{
-            background: {C["bg_soft"]};
-            color: {C["accent"]};
-            border-color: {C["accent_border"]};
-        }}
-        QTabWidget#settingsTabs > QTabBar::tab:hover:!selected {{
+        QTabBar::tab:hover:!selected {{
             color: {C["text"]};
-            background: rgba(255, 255, 255, 0.06);
+            background: rgba(255, 255, 255, 0.08);
+            border-color: {C["border_hover"]};
+        }}
+        QTabBar::tab:selected {{
+            background: {C["accent_muted"]};
+            color: {C["accent"]};
+            border: 1px solid {C["accent_border"]};
+            font-weight: 600;
         }}
         QGroupBox#settingsGroup {{
             color: {C["text"]};
@@ -736,22 +1018,27 @@ def settings_stylesheet() -> str:
             color: {C["text_muted"]};
         }}
         QKeySequenceEdit, QKeySequenceEdit#shortcutEdit {{
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.04);
             border: 1px solid {C["border"]};
             border-radius: {R["input"]}px;
             color: {C["text"]};
-            padding: 8px 12px;
+            padding: 6px 10px;
             font-size: 13px;
-            min-height: 18px;
+            min-height: 20px;
+            max-width: 120px;
         }}
-        QKeySequenceEdit:focus {{
+        QKeySequenceEdit:hover, QKeySequenceEdit#shortcutEdit:hover {{
+            border-color: {C["border_hover"]};
+            background: rgba(255, 255, 255, 0.06);
+        }}
+        QKeySequenceEdit:focus, QKeySequenceEdit#shortcutEdit:focus {{
             border-color: {C["border_focus"]};
+            background: rgba(240, 128, 96, 0.05);
         }}
         QListWidget#tagList {{
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid {C["border_subtle"]};
-            border-radius: {R["input"]}px;
-            padding: 4px;
+            background: transparent;
+            border: none;
+            padding: 0;
         }}
         QListWidget#tagList::item {{
             border: none;
@@ -760,30 +1047,34 @@ def settings_stylesheet() -> str:
         QLabel#tagChipLabel {{
             color: {C["text"]};
             font-size: {F["size_sm"]}px;
+            font-weight: 500;
         }}
         QPushButton#tagRemoveBtn {{
             background: transparent;
             color: {C["text_muted"]};
             border: none;
             font-size: 14px;
+            font-weight: 700;
             padding: 0;
         }}
         QPushButton#tagRemoveBtn:hover {{
             color: {C["accent"]};
         }}
         QListWidget#projectsList {{
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid {C["border_subtle"]};
-            border-radius: {R["input"]}px;
-            padding: 4px;
+            background: transparent;
+            border: none;
+            padding: 0;
             font-size: {F["size_sm"]}px;
         }}
         QListWidget#projectsList::item {{
-            padding: 8px 10px;
-            border-radius: 6px;
+            padding: 0;
+            margin-bottom: 8px;
+            border: none;
+            background: transparent;
         }}
         QListWidget#projectsList::item:selected {{
-            background: {C["accent_muted"]};
-            color: {C["text"]};
+            background: transparent;
+            border: none;
         }}
     """
+

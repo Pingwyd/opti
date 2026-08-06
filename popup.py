@@ -5,6 +5,7 @@ PyQt6 popup window: show/hide, optimize worker, setup dialog.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from typing import Any, Callable, Literal, Optional
 
@@ -18,7 +19,7 @@ from PyQt6.QtCore import (
     QTimer,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QFont, QKeyEvent, QKeySequence, QShortcut
+from PyQt6.QtGui import QColor, QFont, QKeyEvent, QKeySequence, QPainter, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -36,15 +37,23 @@ from PyQt6.QtWidgets import (
 )
 
 from api import optimize_prompt_with_retry
+from brand import APP_NAME
 from config import (
     RESCUE_WINDOW_SHORTCUT,
     center_window_on_screen,
     get_active_model,
     get_auto_copy_clipboard,
+    get_auto_inject_enabled,
     get_pill_collapsed,
     get_shortcut_collapse,
     get_shortcut_hide_tray,
     get_shortcut_private,
+    get_voice_enabled,
+    get_voice_model_size,
+    get_voice_ptt_shortcut,
+    get_voice_recording_mode,
+    get_voice_toggle_max_seconds,
+    get_voice_transcription_mode,
     get_window_position,
     has_api_key,
     key_sequence_from_string,
@@ -57,9 +66,11 @@ from config import (
 )
 from draft import clear_draft, load_draft, save_draft
 from history import add_entry
+from inject import can_inject_target, inject_via_paste, is_blocked_target, is_target_valid
 from projects import get_active_project, list_projects, set_active_project
 from settings_ui import SettingsDialog
 from ui_theme import C, DESIGN_TOKENS, L, popup_stylesheet
+from voice import AudioRecorder, VoiceTranscriber, missing_voice_deps_message, voice_deps_available
 
 # Backward-compatible alias for first-run setup flow.
 SetupDialog = SettingsDialog
@@ -80,6 +91,98 @@ CONTROLS_ROW_HEIGHT = 26
 STATUS_LINE_HEIGHT = 14
 CHIP_WINDOW_SIZE = CHIP_SIZE + ROOT_VERTICAL_MARGIN
 _QT_WIDGETSIZE_MAX = 16777215
+VoiceState = Literal["idle", "recording", "transcribing"]
+
+
+def _play_voice_beep() -> None:
+    if sys.platform == "win32":
+        try:
+            import winsound
+
+            winsound.Beep(880, 60)
+        except Exception:
+            pass
+
+
+class AudioLevelMeter(QWidget):
+    """Simple RMS level meter shown while recording."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("audioLevelMeter")
+        self.setFixedSize(44, 18)
+        self._level = 0.0
+
+    def set_level(self, level: float) -> None:
+        self._level = max(0.0, min(1.0, float(level) * 10.0))
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001, N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bar_count = 5
+        gap = 2
+        width = self.width()
+        height = self.height()
+        bar_w = max(3, (width - gap * (bar_count - 1)) // bar_count)
+        for index in range(bar_count):
+            threshold = (index + 1) / bar_count
+            active = self._level >= threshold * 0.85
+            color = QColor(C["danger"] if active else C["text_muted"])
+            color.setAlpha(220 if active else 90)
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            bar_h = int(height * (0.35 + 0.65 * ((index + 1) / bar_count)))
+            x = index * (bar_w + gap)
+            y = height - bar_h
+            painter.drawRoundedRect(x, y, bar_w, bar_h, 2, 2)
+        painter.end()
+        super().paintEvent(event)
+
+
+class VoiceMicButton(QPushButton):
+    """Mic control with explicit press/release for push-to-talk."""
+
+    pressed_hold = pyqtSignal()
+    released_hold = pyqtSignal()
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001, N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.pressed_hold.emit()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001, N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.released_hold.emit()
+        super().mouseReleaseEvent(event)
+
+
+class TranscribeWorker(QThread):
+    """Run local voice transcription off the UI thread."""
+
+    finished = pyqtSignal(dict)
+    download_progress = pyqtSignal(int, int)
+
+    def __init__(self, audio: Any, *, model_size: str) -> None:
+        super().__init__()
+        self._audio = audio
+        self._model_size = model_size
+
+    def run(self) -> None:
+        payload: dict[str, Any]
+        try:
+            transcriber = VoiceTranscriber(
+                model_size=self._model_size,
+                on_download_progress=lambda current, total: self.download_progress.emit(
+                    current, total
+                ),
+            )
+            text = transcriber.transcribe(self._audio)
+            payload = {"ok": True, "text": text}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Transcribe worker failed")
+            payload = {"ok": False, "error": str(exc)}
+        self.finished.emit(payload)
 
 
 class _InputKeyFilter(QObject):
@@ -105,6 +208,25 @@ class _InputKeyFilter(QObject):
                 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                     return False
                 self._submit_cb()
+                return True
+        return False
+
+
+class _VoiceKeyFilter(QObject):
+    """Push-to-talk / toggle voice shortcuts while the popup is focused."""
+
+    def __init__(self, window: "MetaPromptWindow", parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._window = window
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if not isinstance(event, QKeyEvent):
+            return False
+        if event.type() == QEvent.Type.KeyPress:
+            if self._window._handle_voice_key_press(event):
+                return True
+        elif event.type() == QEvent.Type.KeyRelease:
+            if self._window._handle_voice_key_release(event):
                 return True
         return False
 
@@ -300,6 +422,18 @@ class MetaPromptWindow(QWidget):
         self._private_shortcut: QShortcut | None = None
         self._rescue_shortcut: QShortcut | None = None
 
+        self._voice_state: VoiceState = "idle"
+        self._voice_recorder: AudioRecorder | None = None
+        self._voice_worker: TranscribeWorker | None = None
+        self._voice_ptt_key_seq = QKeySequence()
+        self._voice_ptt_keyboard_held = False
+        self._voice_toggle_timer = QTimer(self)
+        self._voice_toggle_timer.setSingleShot(True)
+        self._voice_toggle_timer.timeout.connect(self._on_voice_toggle_timeout)
+        self._voice_pulse_timer = QTimer(self)
+        self._voice_pulse_timer.timeout.connect(self._tick_voice_pulse)
+        self._voice_pulse_on = False
+
         self._draft_save_timer = QTimer(self)
         self._draft_save_timer.setSingleShot(True)
         self._draft_save_timer.timeout.connect(self._persist_draft)
@@ -346,7 +480,7 @@ class MetaPromptWindow(QWidget):
         icon.setObjectName("pillIcon")
         icon.setFixedSize(22, 22)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setAccessibleName("MetaPrompt")
+        icon.setAccessibleName(APP_NAME)
         self._pill_icon = icon
         input_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -373,6 +507,25 @@ class MetaPromptWindow(QWidget):
         self._busy_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._busy_label.hide()
         input_row.addWidget(self._busy_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._voice_level_meter = AudioLevelMeter(self._pill)
+        self._voice_level_meter.hide()
+        input_row.addWidget(self._voice_level_meter, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._voice_status = QLabel("", self._pill)
+        self._voice_status.setObjectName("voiceStatusLabel")
+        self._voice_status.hide()
+        input_row.addWidget(self._voice_status, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._mic_btn = VoiceMicButton("\U0001f3a4", self._pill)
+        self._mic_btn.setObjectName("voiceMicBtn")
+        self._mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mic_btn.setAccessibleName("Voice input")
+        self._mic_btn.setToolTip("Hold to speak (push-to-talk)")
+        self._mic_btn.pressed_hold.connect(self._on_mic_pressed)
+        self._mic_btn.released_hold.connect(self._on_mic_released)
+        self._mic_btn.hide()
+        input_row.addWidget(self._mic_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         pill_layout.addLayout(input_row)
 
@@ -424,6 +577,9 @@ class MetaPromptWindow(QWidget):
         self._update_mode_btn()
         self._update_pill_status_line()
         self._update_control_tooltips()
+        self._voice_key_filter = _VoiceKeyFilter(self)
+        self.installEventFilter(self._voice_key_filter)
+        self._input.installEventFilter(self._voice_key_filter)
 
         self._pill.customContextMenuRequested.connect(self._show_pill_menu)
 
@@ -468,6 +624,22 @@ class MetaPromptWindow(QWidget):
         self._result_text.setReadOnly(False)
         self._result_text.setMinimumHeight(RESULT_MIN_HEIGHT - 60)
         result_layout.addWidget(self._result_text)
+
+        self._inject_row = QWidget(self._result_frame)
+        self._inject_row.setObjectName("injectRow")
+        inject_layout = QHBoxLayout(self._inject_row)
+        inject_layout.setContentsMargins(0, 0, 0, 0)
+        inject_layout.setSpacing(8)
+        self._inject_label = QLabel("", self._inject_row)
+        self._inject_label.setObjectName("injectLabel")
+        self._inject_btn = QPushButton("Inject", self._inject_row)
+        self._inject_btn.setObjectName("injectBtn")
+        self._inject_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._inject_btn.clicked.connect(self._on_inject_clicked)
+        inject_layout.addWidget(self._inject_label, stretch=1)
+        inject_layout.addWidget(self._inject_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._inject_row.hide()
+        result_layout.addWidget(self._inject_row)
 
         root.addWidget(self._result_frame)
 
@@ -526,6 +698,219 @@ class MetaPromptWindow(QWidget):
             rescue.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             rescue.activated.connect(self.reset_window_position)
             self._rescue_shortcut = rescue
+
+        self._reload_voice_settings()
+
+    def _reload_voice_settings(self) -> None:
+        """Refresh voice UI from config (call after settings save)."""
+        self._voice_ptt_key_seq = key_sequence_from_string(get_voice_ptt_shortcut())
+        enabled = get_voice_enabled()
+        self._mic_btn.setVisible(enabled)
+        if not enabled:
+            self._stop_voice_recording(silent=True)
+            self._cancel_voice_transcription()
+        mode = get_voice_recording_mode()
+        ptt_hint = self._shortcut_hint(self._voice_ptt_key_seq)
+        if mode == "toggle":
+            self._mic_btn.setToolTip(
+                f"Click to start/stop recording{ptt_hint}"
+            )
+        else:
+            self._mic_btn.setToolTip(
+                f"Hold to speak, or hold {get_voice_ptt_shortcut()} while focused{ptt_hint}"
+            )
+        if enabled and not voice_deps_available():
+            self._mic_btn.setEnabled(False)
+            self._mic_btn.setToolTip(missing_voice_deps_message())
+        else:
+            self._mic_btn.setEnabled(True)
+        self._update_voice_ui()
+
+    def _voice_can_start(self) -> bool:
+        return (
+            get_voice_enabled()
+            and not self._busy
+            and self._voice_state == "idle"
+            and voice_deps_available()
+            and not self._pill_collapsed
+        )
+
+    def _update_voice_ui(self) -> None:
+        recording = self._voice_state == "recording"
+        transcribing = self._voice_state == "transcribing"
+        self._mic_btn.setProperty("recording", "true" if recording else "false")
+        self._mic_btn.setProperty("transcribing", "true" if transcribing else "false")
+        self._mic_btn.style().unpolish(self._mic_btn)
+        self._mic_btn.style().polish(self._mic_btn)
+        if recording:
+            self._voice_status.setText("recording…")
+            self._voice_status.show()
+            self._voice_level_meter.show()
+            if not self._voice_pulse_timer.isActive():
+                self._voice_pulse_timer.start(450)
+        else:
+            self._voice_pulse_timer.stop()
+            self._voice_level_meter.hide()
+            self._voice_level_meter.set_level(0.0)
+            if transcribing:
+                self._voice_status.setText("Transcribing…")
+                self._voice_status.show()
+            else:
+                self._voice_status.hide()
+        self._mic_btn.setEnabled(
+            get_voice_enabled()
+            and voice_deps_available()
+            and not self._busy
+            and self._voice_state != "transcribing"
+        )
+
+    def _tick_voice_pulse(self) -> None:
+        self._voice_pulse_on = not self._voice_pulse_on
+        self._mic_btn.setProperty("pulse", "true" if self._voice_pulse_on else "false")
+        self._mic_btn.style().unpolish(self._mic_btn)
+        self._mic_btn.style().polish(self._mic_btn)
+
+    def _on_voice_level(self, level: float) -> None:
+        self._voice_level_meter.set_level(level)
+
+    def _on_mic_pressed(self) -> None:
+        if get_voice_recording_mode() == "toggle":
+            if self._voice_state == "recording":
+                self._stop_voice_recording()
+            elif self._voice_can_start():
+                self._start_voice_recording(source="mic")
+            return
+        if self._voice_can_start():
+            self._start_voice_recording(source="mic")
+
+    def _on_mic_released(self) -> None:
+        if get_voice_recording_mode() == "push_to_talk" and self._voice_state == "recording":
+            self._stop_voice_recording()
+
+    def _is_ptt_shortcut(self, event: QKeyEvent) -> bool:
+        if self._voice_ptt_key_seq.isEmpty():
+            return False
+        pressed = QKeySequence(event.keyCombination())
+        return pressed == self._voice_ptt_key_seq
+
+    def _handle_voice_key_press(self, event: QKeyEvent) -> bool:
+        if not get_voice_enabled() or event.isAutoRepeat() or not self._is_ptt_shortcut(event):
+            return False
+        mode = get_voice_recording_mode()
+        if mode == "push_to_talk":
+            if self._voice_can_start():
+                self._start_voice_recording(source="keyboard")
+            return True
+        if self._voice_state == "recording":
+            self._stop_voice_recording()
+        elif self._voice_can_start():
+            self._start_voice_recording(source="keyboard")
+        return True
+
+    def _handle_voice_key_release(self, event: QKeyEvent) -> bool:
+        if not get_voice_enabled() or not self._is_ptt_shortcut(event):
+            return False
+        if (
+            get_voice_recording_mode() == "push_to_talk"
+            and self._voice_state == "recording"
+            and self._voice_ptt_keyboard_held
+        ):
+            self._stop_voice_recording()
+            return True
+        return False
+
+    def _start_voice_recording(self, *, source: str) -> None:
+        if not self._voice_can_start():
+            return
+        if get_voice_transcription_mode(private_mode=self._private_mode) != "local":
+            self._flash_status("Cloud transcription is not available yet.")
+            return
+        try:
+            self._voice_recorder = AudioRecorder(
+                on_level=lambda level: QTimer.singleShot(
+                    0, lambda lvl=level: self._on_voice_level(lvl)
+                ),
+            )
+            self._voice_recorder.start()
+        except Exception as exc:
+            log.warning("Failed to start voice recording", exc_info=True)
+            self._flash_status(str(exc))
+            self._voice_recorder = None
+            return
+        self._voice_state = "recording"
+        self._voice_ptt_keyboard_held = source == "keyboard"
+        _play_voice_beep()
+        if get_voice_recording_mode() == "toggle":
+            max_seconds = get_voice_toggle_max_seconds()
+            self._voice_toggle_timer.start(max_seconds * 1000)
+        self._update_voice_ui()
+
+    def _stop_voice_recording(self, *, silent: bool = False) -> None:
+        if self._voice_state != "recording":
+            return
+        self._voice_toggle_timer.stop()
+        self._voice_ptt_keyboard_held = False
+        audio = None
+        if self._voice_recorder is not None:
+            try:
+                audio = self._voice_recorder.stop()
+            except Exception:
+                log.warning("Failed to stop voice recording", exc_info=True)
+            self._voice_recorder = None
+        if not silent:
+            _play_voice_beep()
+        if audio is None or getattr(audio, "size", 0) == 0:
+            self._voice_state = "idle"
+            self._update_voice_ui()
+            if not silent:
+                self._flash_status("No audio captured.")
+            return
+        self._voice_state = "transcribing"
+        self._update_voice_ui()
+        model_size = get_voice_model_size()
+        self._voice_worker = TranscribeWorker(audio, model_size=model_size)
+        self._voice_worker.finished.connect(self._on_transcribe_done)
+        self._voice_worker.start()
+
+    def _cancel_voice_transcription(self) -> None:
+        if self._voice_worker is not None and self._voice_worker.isRunning():
+            self._voice_worker.requestInterruption()
+        self._voice_worker = None
+        self._voice_state = "idle"
+        self._update_voice_ui()
+
+    def _on_voice_toggle_timeout(self) -> None:
+        if self._voice_state == "recording":
+            self._stop_voice_recording()
+            self._flash_status("Recording stopped (max duration).")
+
+    def _on_transcribe_done(self, payload: dict[str, Any]) -> None:
+        self._voice_worker = None
+        self._voice_state = "idle"
+        self._update_voice_ui()
+        if payload.get("ok"):
+            text = str(payload.get("text") or "").strip()
+            if text:
+                self._insert_transcription(text)
+                self._draft_save_timer.start(400)
+            else:
+                self._flash_status("No speech detected.")
+        else:
+            error = str(payload.get("error") or "Transcription failed.")
+            self._flash_status(error)
+
+    def _insert_transcription(self, text: str) -> None:
+        current = self._input.toPlainText()
+        cursor = self._input.textCursor()
+        if not current.strip():
+            self._input.setPlainText(text)
+            cursor = self._input.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self._input.setTextCursor(cursor)
+        else:
+            cursor.insertText(f" {text}")
+        self._schedule_resize_input()
+        self._input.setFocus()
 
     def _available_screen_rects(self) -> list[tuple[int, int, int, int]]:
         rects: list[tuple[int, int, int, int]] = []
@@ -896,6 +1281,9 @@ class MetaPromptWindow(QWidget):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self._input.setEnabled(not busy)
+        if busy and self._voice_state == "recording":
+            self._stop_voice_recording(silent=True)
+        self._update_voice_ui()
         if busy:
             self._spinner_index = 0
             self._busy_label.setText(self._spinner_frames[0])
@@ -930,15 +1318,62 @@ class MetaPromptWindow(QWidget):
             self._last_optimized_input = self._pending_optimize_text
             self._session_has_optimization_result = True
             clear_draft()
+            self._update_inject_row()
         else:
             error = payload.get("error") or "Unknown error"
             self._result_text.setPlainText(error)
             self._status_label.setText("Error")
             self._status_label.setStyleSheet(f"color: {C['danger']}; font-size: 12px;")
+            self._hide_inject_row()
 
         if self._pill_collapsed:
             self.expand()
         self.expand_result()
+
+    def _update_inject_row(self) -> None:
+        self._hide_inject_row()
+        if not get_auto_inject_enabled():
+            return
+        target = self._controller.get_inject_target()
+        if not can_inject_target(target):
+            return
+        title = str((target or {}).get("title") or "Unknown window")
+        self._inject_label.setText(f'Inject into: "{title}"')
+        self._inject_row.show()
+        self._update_window_height()
+
+    def _hide_inject_row(self) -> None:
+        if self._inject_row.isVisible():
+            self._inject_row.hide()
+            self._update_window_height()
+
+    def _on_inject_clicked(self) -> None:
+        target = self._controller.get_inject_target()
+        if not target:
+            self._flash_status("No inject target available. Use clipboard instead.")
+            self._hide_inject_row()
+            return
+
+        hwnd = target.get("hwnd")
+        title = target.get("title")
+        process_name = target.get("process_name")
+        if not is_target_valid(hwnd):
+            self._flash_status("Target window is no longer available. Use clipboard instead.")
+            self._hide_inject_row()
+            self._controller.clear_inject_target()
+            return
+        if is_blocked_target(title, process_name):
+            self._flash_status("Cannot inject into this target.")
+            self._hide_inject_row()
+            return
+
+        ok, message = inject_via_paste(int(hwnd), self._result_text.toPlainText())
+        if ok:
+            self._controller.clear_inject_target()
+            self._hide_inject_row()
+            self.collapse()
+        else:
+            self._flash_status(message)
 
     def _copy_result(self) -> None:
         try:
@@ -957,6 +1392,7 @@ class MetaPromptWindow(QWidget):
         self._update_window_height()
 
     def collapse_result(self, reset_ui: bool = False) -> None:
+        self._hide_inject_row()
         self._resize_compact()
         if reset_ui:
             self._reset_ui(clear_input=True)
@@ -1236,7 +1672,11 @@ class MetaPromptWindow(QWidget):
         *,
         force_expand: bool = False,
         force_collapse: bool = False,
+        record_inject_target: bool = True,
     ) -> None:
+        if record_inject_target:
+            self._controller.record_inject_target_if_needed()
+
         if not has_api_key():
             SetupDialog.run_if_needed(self)
 
@@ -1272,6 +1712,8 @@ class MetaPromptWindow(QWidget):
         self._visible = True
 
     def hide_popup(self) -> None:
+        if self._voice_state == "recording":
+            self._stop_voice_recording(silent=True)
         self.flush_draft()
         self._position_save_timer.stop()
         self._persist_window_position()
@@ -1303,11 +1745,11 @@ class MetaPromptWindow(QWidget):
         super().showEvent(event)
         self._schedule_resize_input()
 
-    def toggle_popup(self) -> None:
+    def toggle_popup(self, *, record_inject_target: bool = True) -> None:
         if self._visible and self.isVisible():
             self.hide_popup()
         else:
-            self.show_popup()
+            self.show_popup(record_inject_target=record_inject_target)
 
     def toggle_collapse_global(self) -> None:
         """Global hotkey: hidden → chip; chip → expand; expanded → collapse."""
@@ -1323,6 +1765,8 @@ class MetaPromptWindow(QWidget):
             self.collapse()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
+        if self._voice_state == "recording":
+            self._stop_voice_recording(silent=True)
         self.flush_draft()
         self._position_save_timer.stop()
         self._persist_window_position(force=True)
@@ -1396,6 +1840,8 @@ class PopupController(QObject):
         self._on_settings_saved: Callable[[], None] | None = None
         self._settings_tab: str | None = None
         self._settings_new_project = False
+        self._inject_target: dict[str, Any] | None = None
+        self._inject_target_from_hotkey = False
 
         self._show_signal.connect(self._show_main_thread)
         self._hide_signal.connect(self._hide_main_thread)
@@ -1423,6 +1869,29 @@ class PopupController(QObject):
         self.window = MetaPromptWindow(self)
         return self.window
 
+    def record_inject_target_from_hotkey(self) -> None:
+        """Capture foreground window on the hotkey thread before the pill is shown."""
+        from inject import record_foreground_target
+
+        self._inject_target = record_foreground_target() or None
+        self._inject_target_from_hotkey = bool(self._inject_target)
+
+    def record_inject_target_if_needed(self) -> None:
+        """Capture foreground window when opening via tray/history (not hotkey)."""
+        if self._inject_target_from_hotkey:
+            self._inject_target_from_hotkey = False
+            return
+        from inject import record_foreground_target
+
+        self._inject_target = record_foreground_target() or None
+
+    def get_inject_target(self) -> dict[str, Any] | None:
+        return self._inject_target
+
+    def clear_inject_target(self) -> None:
+        self._inject_target = None
+        self._inject_target_from_hotkey = False
+
     def show(self) -> None:
         self._show_signal.emit()
 
@@ -1433,15 +1902,34 @@ class PopupController(QObject):
         """Thread-safe: toggle show/hide (expanded or chip)."""
         self._toggle_signal.emit()
 
+    def toggle_from_hotkey(self) -> None:
+        """Global hotkey: record foreground target before showing the pill."""
+        if not self.is_visible:
+            self.record_inject_target_from_hotkey()
+        self.toggle()
+
     def toggle_collapse_global(self) -> None:
         """Thread-safe: global collapse/expand chip hotkey."""
         self._toggle_collapse_global_signal.emit()
+
+    def toggle_collapse_global_from_hotkey(self) -> None:
+        """Global collapse hotkey: record target only when showing from hidden."""
+        with self._lock:
+            if self.window is not None:
+                action = collapse_global_action(
+                    is_visible=bool(self.window._visible and self.window.isVisible()),
+                    is_collapsed=self.window._pill_collapsed,
+                )
+                if action == "show_chip":
+                    self.record_inject_target_from_hotkey()
+        self.toggle_collapse_global()
 
     def _show_main_thread(self) -> None:
         with self._lock:
             if self.window is None:
                 return
-            self.window.show_popup()
+            self.window.show_popup(record_inject_target=not self._inject_target_from_hotkey)
+            self._inject_target_from_hotkey = False
             self._visible = True
 
     def _hide_main_thread(self) -> None:
@@ -1455,7 +1943,8 @@ class PopupController(QObject):
         with self._lock:
             if self.window is None:
                 return
-            self.window.toggle_popup()
+            self.window.toggle_popup(record_inject_target=not self._inject_target_from_hotkey)
+            self._inject_target_from_hotkey = False
             self._visible = self.window._visible
 
     def _toggle_collapse_global_main_thread(self) -> None:
@@ -1463,13 +1952,27 @@ class PopupController(QObject):
             if self.window is None:
                 return
             self.window.toggle_collapse_global()
+            self._inject_target_from_hotkey = False
             self._visible = self.window._visible
 
     def _show_expanded_main_thread(self) -> None:
         with self._lock:
             if self.window is None:
                 return
-            self.window.activate_for_user()
+            if self.window._visible and self.window.isVisible():
+                self.window.validate_window_position()
+                if self.window._pill_collapsed:
+                    self.window.expand()
+                else:
+                    self.window.raise_()
+                    self.window.activateWindow()
+                    self.window._input.setFocus()
+                return
+            self.window.show_popup(
+                force_expand=True,
+                record_inject_target=not self._inject_target_from_hotkey,
+            )
+            self._inject_target_from_hotkey = False
             self._visible = self.window._visible
 
     def collapse(self, reset_ui: bool = False) -> None:
