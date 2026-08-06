@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 block_cipher = None
-ROOT = Path(SPECPATH).parent.parent
+ROOT = Path(SPECPATH).parent
 
 a = Analysis(
     [str(ROOT / "main.py")],
