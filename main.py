@@ -28,6 +28,7 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 from PyQt6.QtCore import QTimer  # noqa: E402
+from PyQt6.QtGui import QIcon, QImage, QPixmap  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from brand import APP_NAME, APP_VERSION, TRAY_TOOLTIP  # noqa: E402
@@ -68,6 +69,16 @@ def make_tray_icon_image():
     draw.ellipse((22, 20, 42, 40), fill=(240, 128, 96, 230))
     draw.ellipse((30, 34, 44, 48), fill=(240, 128, 96, 140))
     return img
+
+
+def app_icon() -> QIcon:
+    """Shared window/tray icon so Qt never falls back to the framework logo."""
+    img = make_tray_icon_image()
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    data = img.tobytes("raw", "RGBA")
+    qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+    return QIcon(QPixmap.fromImage(qimg))
 
 
 def start_tray(on_quit, icon_holder: dict[str, Any]) -> None:
@@ -166,6 +177,7 @@ def main() -> None:
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
+    app.setWindowIcon(app_icon())
 
     apply_start_with_windows_from_config()
 
@@ -253,7 +265,7 @@ def main() -> None:
         log.debug("Update check on launch is enabled (stub — not implemented)")
 
     if not get_start_minimized_to_tray():
-        controller.show_expanded()
+        controller.show_expanded(capture_inject_target=False)
 
     sys.exit(app.exec())
 

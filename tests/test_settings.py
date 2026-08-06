@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QPushButton
 
 import config
 from config import (
@@ -273,14 +275,94 @@ def test_apply_settings_startup_options_round_trip(isolated_config):
     assert config.get_check_updates_on_launch() is True
 
 
-def test_settings_dialog_save_button_dirty_state(qapp, isolated_config):
+def test_settings_dialog_immediate_apply_footer(qapp, isolated_config):
     config.load_config()
     dlg = SettingsDialog()
-    assert dlg._save_btn.property("dirty") == "false"
+    assert not hasattr(dlg, "_save_btn")
+    close_btns = dlg.findChildren(QPushButton, "footerCloseBtn")
+    assert len(close_btns) == 1
+    assert close_btns[0].text() == "Close"
+    dlg.close()
 
-    dlg._mode_combo.setCurrentIndex(1)
+
+def test_settings_voice_toggle_immediate_apply(qapp, isolated_config):
+    config.load_config()
+    dlg = SettingsDialog()
+    assert not dlg._voice_enabled_toggle.isChecked()
+    dlg._voice_enabled_toggle.setChecked(True)
     qapp.processEvents()
-    assert dlg._save_btn.property("dirty") == "true"
+    assert config.load_config()["voice_enabled"] is True
+    dlg._voice_enabled_toggle.setChecked(False)
+    qapp.processEvents()
+    assert config.load_config()["voice_enabled"] is False
+    dlg.close()
+
+
+def test_debounced_config_writer_coalesces_writes(qapp, isolated_config, monkeypatch):
+    from settings_ui import DebouncedConfigWriter
+
+    writes: list[dict] = []
+
+    def fake_update(patch):
+        writes.append(dict(patch))
+        return patch
+
+    monkeypatch.setattr("settings_ui.update_config", fake_update)
+    writer = DebouncedConfigWriter(50, qapp)
+    writer.write({"model": "a"}, immediate=False)
+    writer.write({"model": "b"}, immediate=False)
+    writer.write({"model_fast": "c"}, immediate=False)
+    assert len(writes) == 0
+
+    deadline = time.time() + 1.0
+    while not writes and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.02)
+
+    assert len(writes) == 1
+    assert writes[0] == {"model": "b", "model_fast": "c"}
+    writer.shutdown()
+
+
+def test_compute_shortcut_conflicts_detects_duplicates():
+    from settings_ui import compute_shortcut_conflicts
+
+    conflicts = compute_shortcut_conflicts(
+        "Ctrl+Alt+,",
+        "Ctrl+Alt+,",
+        "Ctrl+Alt+]",
+        "Esc",
+        "Ctrl+Shift+P",
+    )
+    assert conflicts["hotkey"] is True
+    assert conflicts["hotkey_collapse"] is True
+    assert conflicts["shortcut_collapse"] is False
+
+
+def test_setting_row_height_scales_with_font(qapp):
+    from PyQt6.QtGui import QFont
+    from widgets import SettingRow
+
+    small = SettingRow("Label")
+    small.label_widget().setFont(QFont("Segoe UI", 10))
+    small._recompute_height()
+    small_h = small.minimumHeight()
+
+    large = SettingRow("Label")
+    large.label_widget().setFont(QFont("Segoe UI", 16))
+    large._recompute_height()
+    large_h = large.minimumHeight()
+
+    assert large_h > small_h
+
+
+def test_project_color_is_stable_across_calls():
+    from ui_theme import project_color
+
+    a = project_color("MetaPrompt")
+    b = project_color("MetaPrompt")
+    assert a == b
+    assert a != project_color("")
 
 
 def test_hotkey_collapse_config_defaults(isolated_config):

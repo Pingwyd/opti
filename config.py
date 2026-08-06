@@ -53,6 +53,38 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
 
 VALID_PROVIDERS = tuple(PROVIDER_PRESETS.keys())
 
+# Known model-ID prefixes per provider, used for soft validation (warn, never block —
+# new model names ship constantly and this list will always lag reality).
+MODEL_ID_PREFIXES: dict[str, tuple[str, ...]] = {
+    "gemini": ("gemini-",),
+    "anthropic": ("claude-",),
+    "groq": ("llama-", "mixtral-", "gemma-", "deepseek-", "qwen-", "openai/gpt-"),
+    "openrouter": (
+        "google/",
+        "anthropic/",
+        "openai/",
+        "meta-llama/",
+        "mistralai/",
+        "deepseek/",
+        "qwen/",
+        "x-ai/",
+    ),
+}
+
+
+def is_recognized_model_id(provider: str, model_id: str) -> bool:
+    """True when model_id looks like a real ID for provider (soft check, not exhaustive)."""
+    normalized = (model_id or "").strip().lower()
+    if not normalized:
+        return True
+    provider = (provider or "").lower().strip()
+    if provider == "openrouter":
+        return "/" in normalized
+    prefixes = MODEL_ID_PREFIXES.get(provider, ())
+    if not prefixes:
+        return True
+    return any(normalized.startswith(prefix) for prefix in prefixes)
+
 # Popup keyboard shortcuts (stored in config.json, not QSettings — same persistence as other settings)
 DEFAULT_HOTKEY = "Ctrl+Shift+Space"
 DEFAULT_HOTKEY_COLLAPSE = "Ctrl+Alt+M"
@@ -88,6 +120,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "window_y": None,
     "chip_x": None,
     "chip_y": None,
+    "settings_window_x": None,
+    "settings_window_y": None,
+    "settings_window_w": 880,
+    "settings_window_h": 560,
+    "history_window_x": None,
+    "history_window_y": None,
+    "history_window_w": 960,
+    "history_window_h": 640,
+    "history_split_ratio": 0.55,
     "shortcut_collapse": DEFAULT_SHORTCUT_COLLAPSE,
     "shortcut_hide_tray": DEFAULT_SHORTCUT_HIDE_TRAY,
     "shortcut_private": DEFAULT_SHORTCUT_PRIVATE,
@@ -102,6 +143,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "voice_model_size": "base",
     "voice_toggle_max_seconds": 60,
     "voice_ptt_shortcut": DEFAULT_VOICE_PTT_SHORTCUT,
+    "first_run_complete": False,
+    "private_session": False,
 }
 
 # Migrate legacy model IDs (Claude defaults, Gemini 2.5, old OpenRouter slugs)
@@ -190,6 +233,81 @@ def save_config(config: dict[str, Any]) -> None:
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2)
         f.write("\n")
+
+
+def update_config(patch: dict[str, Any]) -> dict[str, Any]:
+    """
+    Merge `patch` into config.json and return the merged config.
+
+    Small generic write helper for immediate-apply UI code (settings dialog):
+    callers write one or a few keys at a time instead of round-tripping the
+    full settings form. Safe to call from a background thread.
+    """
+    cfg = load_config()
+    cfg.update(patch)
+    save_config(cfg)
+    return cfg
+
+
+def get_settings_window_geometry() -> tuple[int | None, int | None, int, int]:
+    """Return (x, y, width, height) for the settings dialog; x/y are None until first move."""
+    cfg = load_config()
+    x, y = cfg.get("settings_window_x"), cfg.get("settings_window_y")
+    width = int(cfg.get("settings_window_w") or 880)
+    height = int(cfg.get("settings_window_h") or 560)
+    return (
+        x if isinstance(x, int) else None,
+        y if isinstance(y, int) else None,
+        max(880, width),
+        max(560, height),
+    )
+
+
+def set_settings_window_geometry(x: int, y: int, width: int, height: int) -> None:
+    update_config(
+        {
+            "settings_window_x": int(x),
+            "settings_window_y": int(y),
+            "settings_window_w": max(880, int(width)),
+            "settings_window_h": max(560, int(height)),
+        }
+    )
+
+
+def get_history_window_geometry() -> tuple[int | None, int | None, int, int, float]:
+    """Return (x, y, width, height, list_split_ratio) for the history dialog."""
+    cfg = load_config()
+    x, y = cfg.get("history_window_x"), cfg.get("history_window_y")
+    width = int(cfg.get("history_window_w") or 960)
+    height = int(cfg.get("history_window_h") or 640)
+    ratio = float(cfg.get("history_split_ratio") or 0.55)
+    ratio = max(0.25, min(0.75, ratio))
+    return (
+        x if isinstance(x, int) else None,
+        y if isinstance(y, int) else None,
+        max(900, width),
+        max(600, height),
+        ratio,
+    )
+
+
+def set_history_window_geometry(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    *,
+    split_ratio: float | None = None,
+) -> None:
+    patch: dict[str, Any] = {
+        "history_window_x": int(x),
+        "history_window_y": int(y),
+        "history_window_w": max(900, int(width)),
+        "history_window_h": max(600, int(height)),
+    }
+    if split_ratio is not None:
+        patch["history_split_ratio"] = max(0.25, min(0.75, float(split_ratio)))
+    update_config(patch)
 
 
 def get_provider() -> str:
@@ -776,3 +894,23 @@ def get_voice_ptt_shortcut() -> str:
         str(load_config().get("voice_ptt_shortcut") or ""),
         DEFAULT_VOICE_PTT_SHORTCUT,
     )
+
+
+def get_first_run_complete() -> bool:
+    return bool(load_config().get("first_run_complete", False))
+
+
+def set_first_run_complete(complete: bool = True) -> None:
+    cfg = load_config()
+    cfg["first_run_complete"] = bool(complete)
+    save_config(cfg)
+
+
+def get_private_session() -> bool:
+    return bool(load_config().get("private_session", False))
+
+
+def set_private_session(enabled: bool) -> None:
+    cfg = load_config()
+    cfg["private_session"] = bool(enabled)
+    save_config(cfg)
