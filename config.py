@@ -149,7 +149,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_inject_enabled": False,
     "inject_target_mode": "dynamic",
     "inject_pinned_hwnd": None,
-    "projects": {},
     "active_project": None,
     "include_project_context_in_private": False,
     "voice_enabled": False,
@@ -250,6 +249,7 @@ def save_config(config: dict[str, Any]) -> None:
             existing = {}
     existing.update(config)
     existing.pop("api_key", None)  # keys live in vault.json
+    existing.pop("projects", None)  # projects live in projects.json
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2)
         f.write("\n")
