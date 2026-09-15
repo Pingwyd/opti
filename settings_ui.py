@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QInputDialog,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -1695,6 +1696,7 @@ class SettingsDialog(QDialog):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self._projects_list.currentItemChanged.connect(self._on_project_selected)
+        self._projects_list.itemDoubleClicked.connect(self._on_project_list_double_clicked)
         list_col.addWidget(self._projects_list, 1)
 
         body.addWidget(list_wrap, 0)
@@ -1744,7 +1746,9 @@ class SettingsDialog(QDialog):
         detail_layout.addWidget(name_label)
         self._project_name_edit = QLineEdit()
         self._project_name_edit.setFont(settings_font(FONT_BODY))
+        self._project_name_edit.setPlaceholderText("Name shown in the pill and project list")
         self._project_name_edit.textChanged.connect(self._on_project_form_changed)
+        self._project_name_edit.returnPressed.connect(self._on_project_name_return_pressed)
         detail_layout.addWidget(self._project_name_edit)
 
         type_label = QLabel("Project type")
@@ -1975,8 +1979,15 @@ class SettingsDialog(QDialog):
     def _update_footer_hint(self) -> None:
         if self._footer_hint is None:
             return
-        if self._projects_pane_active() and self._project_is_dirty():
-            self._footer_hint.setText("You have unsaved project changes")
+        if self._projects_pane_active():
+            if self._project_is_dirty():
+                self._footer_hint.setText(
+                    "Unsaved project changes — click Save (or press Enter in the name field)"
+                )
+            else:
+                self._footer_hint.setText(
+                    "On Projects: edit fields and click Save. Other panes apply immediately."
+                )
         else:
             self._footer_hint.setText("Changes apply immediately")
 
@@ -2030,6 +2041,14 @@ class SettingsDialog(QDialog):
 
     def _on_project_save_clicked(self) -> None:
         self._save_current_project()
+
+    def _on_project_name_return_pressed(self) -> None:
+        if self._project_save_btn.isEnabled():
+            self._save_current_project()
+
+    def _on_project_list_double_clicked(self, _item: QListWidgetItem) -> None:
+        self._project_name_edit.setFocus()
+        self._project_name_edit.selectAll()
 
     def _on_project_cancel_clicked(self) -> None:
         self._revert_project_form()
@@ -2110,10 +2129,34 @@ class SettingsDialog(QDialog):
             n += 1
         return f"{base} {n}"
 
+    def _prompt_new_project_name(self) -> str | None:
+        """Ask for a display name before creating a project."""
+        default = self._unique_new_project_name()
+        while True:
+            name, ok = QInputDialog.getText(
+                self,
+                "New project",
+                "Project name:",
+                QLineEdit.EchoMode.Normal,
+                default,
+            )
+            if not ok:
+                return None
+            stripped = name.strip()
+            if stripped:
+                return stripped
+            QMessageBox.warning(
+                self,
+                "New project",
+                "Project name cannot be empty.",
+            )
+
     def _on_new_project(self) -> None:
         if not self._confirm_discard_project_changes():
             return
-        name = self._unique_new_project_name()
+        name = self._prompt_new_project_name()
+        if name is None:
+            return
         self._pending_new_project = True
         self._writer.run_task(lambda: create_project(name=name))
 
