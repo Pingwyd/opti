@@ -374,6 +374,7 @@ class HistoryRowDelegate(QStyledItemDelegate):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._hover_row = -1
+        self._hover_action: str | None = None
         self._copy_confirm_row = -1
         self._copy_timer = QTimer(self)
         self._copy_timer.setSingleShot(True)
@@ -401,29 +402,46 @@ class HistoryRowDelegate(QStyledItemDelegate):
     def row_height(self) -> int:
         return self._row_height
 
-    def set_hover_row(self, row: int) -> None:
-        if row != self._hover_row:
+    def set_hover(self, row: int, action: str | None = None) -> None:
+        """Track row- and action-level hover for painting and hit-testing."""
+        if row != self._hover_row or action != self._hover_action:
             self._hover_row = row
+            self._hover_action = action if row >= 0 else None
+
+    def set_hover_row(self, row: int) -> None:
+        self.set_hover(row, None)
+
+    def hit_action(self, row: int, local_pos: QPoint) -> str | None:
+        """Return the action id under ``local_pos`` (item-local coordinates)."""
+        rects = self._action_rects.get(row)
+        if not rects:
+            return None
+        for action, rect in rects.items():
+            if rect.contains(local_pos):
+                return action
+        return None
+
+    def _request_repaint(self) -> None:
+        parent = self.parent()
+        if parent is not None:
+            viewport = parent.viewport() if hasattr(parent, "viewport") else parent
+            viewport.update()
 
     def show_copy_confirm(self, row: int) -> None:
         self._copy_confirm_row = row
         self._copy_timer.start(COPY_CONFIRM_MS)
-        parent = self.parent()
-        if parent is not None:
-            viewport = parent.viewport() if hasattr(parent, "viewport") else parent
-            viewport.update()
+        self._request_repaint()
 
     def _clear_copy_confirm(self) -> None:
         self._copy_confirm_row = -1
-        parent = self.parent()
-        if parent is not None:
-            viewport = parent.viewport() if hasattr(parent, "viewport") else parent
-            viewport.update()
+        self._request_repaint()
 
     def sizeHint(self, option, index) -> QSize:  # noqa: ARG002
         return QSize(option.rect.width(), self._row_height)
 
-    def _badge_rect(self, painter: QPainter, text: str, x: int, y: int) -> tuple[QRect, int]:
+    def _badge_rect(
+        self, painter: QPainter, text: str, x: int, y: int
+    ) -> tuple[QRect, int]:
         fm = QFontMetrics(self._badge_font)
         pad_x, pad_y = 9, 3
         w = fm.horizontalAdvance(text) + pad_x * 2
@@ -438,42 +456,77 @@ class HistoryRowDelegate(QStyledItemDelegate):
         painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), text)
         return rect, w
 
+    def _paint_action_icon(
+        self,
+        painter: QPainter,
+        action: str,
+        icon_rect: QRectF,
+        *,
+        row: int,
+        row_opacity: float,
+        actions_visible: bool,
+    ) -> None:
+        if action == "copy" and row == self._copy_confirm_row:
+            _paint_check_icon(painter, icon_rect, SUCCESS)
+            return
+        if not actions_visible:
+            return
+        hovered = row == self._hover_row and action == self._hover_action
+        color = TEXT_PRIMARY if hovered else TEXT_SECONDARY
+        painter.setOpacity(row_opacity)
+        if action == "copy":
+            _paint_copy_icon(painter, icon_rect, color)
+        elif action == "restore":
+            _paint_restore_icon(painter, icon_rect, color)
+        else:
+            _paint_delete_icon(painter, icon_rect, color)
+
     def paint(self, painter, option, index) -> None:
         entry = index.data(EntryRole)
         if not isinstance(entry, dict):
             return
 
         painter.save()
-        opacity = float(index.data(OpacityRole) or 1.0)
-        painter.setOpacity(opacity)
+        row = index.row()
+        row_opacity = float(index.data(OpacityRole) or 1.0)
+        painter.setOpacity(row_opacity)
 
         rect = option.rect
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = row == self._hover_row
+        actions_visible = hovered
 
         if selected:
             painter.fillRect(rect, QColor(CORAL_TINT))
             painter.fillRect(QRect(rect.left(), rect.top(), 2, rect.height()), QColor(CORAL))
-        elif index.row() == self._hover_row:
+        elif hovered:
             painter.fillRect(rect, QColor(HOVER_TINT))
 
         painter.setPen(QPen(QColor(BORDER_SUBTLE), 0.5))
         painter.drawLine(rect.bottomLeft(), rect.bottomRight())
 
-        inner = rect.adjusted(ROW_MARGIN_H, ROW_MARGIN_V, -ROW_MARGIN_H, -ROW_MARGIN_V)
+        # Item-local coordinates simplify hit-testing in editorEvent.
+        painter.translate(rect.topLeft())
+        local = QRect(0, 0, rect.width(), rect.height())
+        inner = local.adjusted(ROW_MARGIN_H, ROW_MARGIN_V, -ROW_MARGIN_H, -ROW_MARGIN_V)
         fm_time = QFontMetrics(self._time_font)
         fm_preview = QFontMetrics(self._preview_font)
         fm_model = QFontMetrics(self._model_font)
 
         y = inner.top()
         project_name = str(entry.get("project_name") or "").strip() or "No project"
-        badge_rect, badge_w = self._badge_rect(painter, project_name, inner.left(), y)
+        badge_rect, _badge_w = self._badge_rect(painter, project_name, inner.left(), y)
 
         ts = _format_relative_time(str(entry.get("timestamp") or ""))
         painter.setFont(self._time_font)
         painter.setPen(QColor(TEXT_MUTED))
         time_w = fm_time.horizontalAdvance(ts)
         time_rect = QRect(inner.right() - time_w, y, time_w, fm_time.height())
-        painter.drawText(time_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), ts)
+        painter.drawText(
+            time_rect,
+            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight),
+            ts,
+        )
 
         y = badge_rect.bottom() + ROW_SPACING
         preview = str(index.data(PreviewRole) or "")
@@ -481,50 +534,68 @@ class HistoryRowDelegate(QStyledItemDelegate):
         painter.setFont(self._preview_font)
         painter.setPen(QColor(preview_color))
         preview_rect = QRect(inner.left(), y, inner.width(), fm_preview.height())
-        elided = fm_preview.elidedText(preview, Qt.TextElideMode.ElideRight, preview_rect.width())
-        painter.drawText(preview_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), elided)
+        elided = fm_preview.elidedText(
+            preview, Qt.TextElideMode.ElideRight, preview_rect.width()
+        )
+        painter.drawText(
+            preview_rect,
+            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+            elided,
+        )
 
         y = preview_rect.bottom() + ROW_SPACING
         model_id = str(entry.get("model") or "—")
         painter.setFont(self._model_font)
         painter.setPen(QColor(TEXT_MUTED))
         model_rect = QRect(inner.left(), y, inner.width() // 2, fm_model.height())
-        painter.drawText(model_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), model_id)
+        painter.drawText(
+            model_rect,
+            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+            model_id,
+        )
 
         actions = ("copy", "restore", "delete")
         total_w = len(actions) * ACTION_HIT + (len(actions) - 1) * ACTION_GAP
         ax = inner.right() - total_w
         ay = y + (fm_model.height() - ACTION_HIT) // 2
-        action_alpha = 1.0 if index.row() == self._hover_row else 0.0
-        self._action_rects[index.row()] = {}
+        self._action_rects[row] = {}
 
         for i, action in enumerate(actions):
             hit = QRect(ax + i * (ACTION_HIT + ACTION_GAP), ay, ACTION_HIT, ACTION_HIT)
-            self._action_rects[index.row()][action] = hit
+            self._action_rects[row][action] = hit
             icon_rect = QRectF(
                 hit.x() + (ACTION_HIT - ACTION_ICON) / 2,
                 hit.y() + (ACTION_HIT - ACTION_ICON) / 2,
                 ACTION_ICON,
                 ACTION_ICON,
             )
-            if action == "copy" and index.row() == self._copy_confirm_row:
-                color = SUCCESS
-                _paint_check_icon(painter, icon_rect, color)
-            else:
-                if action_alpha <= 0:
-                    painter.setOpacity(0)
-                else:
-                    color = TEXT_PRIMARY
-                    painter.setOpacity(opacity * action_alpha)
-                    if action == "copy":
-                        _paint_copy_icon(painter, icon_rect, color)
-                    elif action == "restore":
-                        _paint_restore_icon(painter, icon_rect, color)
-                    else:
-                        _paint_delete_icon(painter, icon_rect, color)
-                painter.setOpacity(opacity)
+            self._paint_action_icon(
+                painter,
+                action,
+                icon_rect,
+                row=row,
+                row_opacity=row_opacity,
+                actions_visible=actions_visible,
+            )
 
         painter.restore()
+
+    @staticmethod
+    def _local_pos(event, option) -> QPoint:
+        return event.position().toPoint() - option.rect.topLeft()
+
+    def _dispatch_action(self, entry: dict[str, Any], action: str, row: int) -> bool:
+        if action == "copy":
+            self.copy_clicked.emit(entry)
+            self.show_copy_confirm(row)
+            return True
+        if action == "restore":
+            self.restore_clicked.emit(entry)
+            return True
+        if action == "delete":
+            self.delete_clicked.emit(entry)
+            return True
+        return False
 
     def editorEvent(self, event, model, option, index):  # noqa: ARG002
         if not index.isValid():
@@ -533,31 +604,21 @@ class HistoryRowDelegate(QStyledItemDelegate):
         if not isinstance(entry, dict):
             return False
 
+        row = index.row()
+        local_pos = self._local_pos(event, option)
         et = event.type()
+
         if et == event.Type.MouseMove:
-            pos = event.position().toPoint()
-            rects = self._action_rects.get(index.row(), {})
-            for action, rect in rects.items():
-                if rect.contains(pos):
-                    self._hover_row = index.row()
-                    if self.parent():
-                        self.parent().update()
-                    return False
+            action = self.hit_action(row, local_pos)
+            self.set_hover(row, action)
+            self._request_repaint()
             return False
 
-        if et == event.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-            pos = event.position().toPoint()
-            rects = self._action_rects.get(index.row(), {})
-            if rects.get("copy") and rects["copy"].contains(pos):
-                self.copy_clicked.emit(entry)
-                self.show_copy_confirm(index.row())
-                return True
-            if rects.get("restore") and rects["restore"].contains(pos):
-                self.restore_clicked.emit(entry)
-                return True
-            if rects.get("delete") and rects["delete"].contains(pos):
-                self.delete_clicked.emit(entry)
-                return True
+        if event.type() == event.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            action = self.hit_action(row, local_pos)
+            if action and row == self._hover_row:
+                return self._dispatch_action(entry, action, row)
+
         return False
 
     def helpEvent(self, event, view, option, index):  # noqa: ARG002
@@ -1009,6 +1070,7 @@ class HistoryDialog(QDialog):
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._list.setMouseTracking(True)
+        self._list.viewport().setMouseTracking(True)
         self._list.setUniformItemSizes(True)
         self._list.setSpacing(0)
         self._list.setFrameShape(QFrame.Shape.NoFrame)
@@ -1302,25 +1364,31 @@ class HistoryDialog(QDialog):
 
     def eventFilter(self, source, event):  # noqa: N802
         if source is self._list.viewport():
-            if event.type() == event.Type.Leave:
-                self._delegate.set_hover_row(-1)
+            et = event.type()
+            if et == event.Type.Leave:
+                self._delegate.set_hover(-1, None)
                 self._list.viewport().update()
-            elif event.type() == event.Type.MouseMove:
+            elif et == event.Type.MouseMove:
                 pos = event.position().toPoint()
                 index = self._list.indexAt(pos)
-                row = index.row() if index.isValid() else -1
-                self._delegate.set_hover_row(row)
+                if index.isValid():
+                    row = index.row()
+                    local_pos = pos - self._list.visualRect(index).topLeft()
+                    action = self._delegate.hit_action(row, local_pos)
+                    self._delegate.set_hover(row, action)
+                else:
+                    self._delegate.set_hover(-1, None)
                 self._list.viewport().update()
         return super().eventFilter(source, event)
 
     # --- Selection & detail ---
 
     def _on_row_hovered(self, index: QModelIndex) -> None:
-        self._delegate.set_hover_row(index.row())
+        self._delegate.set_hover(index.row(), None)
         self._list.viewport().update()
 
     def _on_row_clicked(self, index: QModelIndex) -> None:
-        self._delegate.set_hover_row(index.row())
+        self._delegate.set_hover(index.row(), None)
 
     def _on_selection_changed(self) -> None:
         indexes = self._list.selectionModel().selectedIndexes()

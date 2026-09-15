@@ -45,6 +45,14 @@ def test_is_retryable_error(exc, expected):
     assert api.is_retryable_error(exc) is expected
 
 
+def test_is_rate_limit_error_message():
+    assert api.is_rate_limit_error("Rate limited by Gemini. Please wait a moment and try again.")
+    assert api.is_rate_limit_error("The API is temporarily busy. Please wait a moment and try again.")
+    assert api.is_rate_limit_error("HTTP 429 too many requests")
+    assert not api.is_rate_limit_error("Authentication failed.")
+    assert not api.is_rate_limit_error("Prompt is empty.")
+
+
 def test_retry_after_seconds_from_headers():
     exc = _FakeApiError(429, headers={"retry-after": "2.5"})
     assert api._retry_after_seconds(exc) == 2.5

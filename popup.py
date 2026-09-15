@@ -18,6 +18,7 @@ from PyQt6.QtCore import (
     QThread,
     QTimer,
     pyqtSignal,
+    pyqtSlot,
 )
 from PyQt6.QtGui import QColor, QFont, QKeyEvent, QKeySequence, QPainter, QShortcut
 from PyQt6.QtWidgets import (
@@ -36,7 +37,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from api import optimize_prompt_with_retry
+from api import is_rate_limit_error, optimize_prompt_with_retry
 from brand import APP_NAME
 from config import (
     RESCUE_WINDOW_SHORTCUT,
@@ -44,12 +45,17 @@ from config import (
     get_active_model,
     get_auto_copy_clipboard,
     get_auto_inject_enabled,
+    get_effective_transform,
     get_first_run_complete,
+    get_inject_pinned_hwnd,
+    get_inject_target_mode,
     get_pill_collapsed,
     get_private_session,
     get_shortcut_collapse,
     get_shortcut_hide_tray,
     get_shortcut_private,
+    get_shortcut_transform_cycle,
+    get_shortcut_transform_cycle_reverse,
     get_voice_enabled,
     get_voice_model_size,
     get_voice_ptt_shortcut,
@@ -61,12 +67,24 @@ from config import (
     key_sequence_from_string,
     load_config,
     set_first_run_complete,
+    set_inject_pinned_hwnd,
+    set_inject_target_mode,
     set_mode,
     set_pill_collapsed,
     set_private_session,
+    set_transform,
     set_window_position,
     screen_for_window,
     validate_window_position as validate_window_coords,
+)
+from transform_ui import (
+    TRANSFORM_CYCLE_ORDER,
+    action_label,
+    menu_label,
+    next_transform,
+    placeholder_for,
+    previous_transform,
+    progress_verb,
 )
 from draft import clear_draft, load_draft, save_draft
 from history import add_entry
@@ -77,9 +95,12 @@ from inject import (
     is_blocked_target,
     is_target_valid,
 )
+from rate_limit_dialog import RateLimitDialog
 from projects import get_active_project, list_projects, set_active_project
 from settings_ui import SettingsDialog
+from target_window_selector import InjectTargetSelector
 from ui_theme import C, DESIGN_TOKENS, L, popup_stylesheet
+from window_service import INJECT_TARGET_DYNAMIC, INJECT_TARGET_PINNED, InjectTargetPreference, WindowService
 from widgets import (
     CharCountLabel,
     GrowingTextEdit,
@@ -87,7 +108,7 @@ from widgets import (
     PILL_PLACEHOLDER,
     PillIconButton,
     PillProgressBar,
-    PrimaryButton,
+    TransformActionButton,
     PrivateToggleChip,
     SelectorChip,
     SparkIcon,
@@ -190,8 +211,18 @@ class TranscribeWorker(QThread):
         super().__init__()
         self._audio = audio
         self._model_size = model_size
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self.requestInterruption()
+
+    def _is_cancelled(self) -> bool:
+        return self._cancelled or self.isInterruptionRequested()
 
     def run(self) -> None:
+        if self._is_cancelled():
+            return
         payload: dict[str, Any]
         try:
             transcriber = VoiceTranscriber(
@@ -199,13 +230,38 @@ class TranscribeWorker(QThread):
                 on_download_progress=lambda current, total: self.download_progress.emit(
                     current, total
                 ),
+                cancel_check=self._is_cancelled,
             )
             text = transcriber.transcribe(self._audio)
+            if self._is_cancelled():
+                return
             payload = {"ok": True, "text": text}
+        except InterruptedError:
+            return
         except Exception as exc:  # noqa: BLE001
+            if self._is_cancelled():
+                return
             log.exception("Transcribe worker failed")
             payload = {"ok": False, "error": str(exc)}
         self.finished.emit(payload)
+
+
+class VoiceModelWarmupWorker(QThread):
+    """Preload the Whisper model so the first utterance is faster."""
+
+    finished = pyqtSignal(bool)
+
+    def __init__(self, model_size: str) -> None:
+        super().__init__()
+        self._model_size = model_size
+
+    def run(self) -> None:
+        try:
+            VoiceTranscriber(model_size=self._model_size).load_model()
+            self.finished.emit(True)
+        except Exception:
+            log.debug("Voice model warmup failed", exc_info=True)
+            self.finished.emit(False)
 
 
 class _InputKeyFilter(QObject):
@@ -288,10 +344,12 @@ class OptimizeWorker(QThread):
                     return
                 self.progress.emit(f"Retrying… ({attempt}/{max_attempts})")
 
+            transform = get_effective_transform()
             result = optimize_prompt_with_retry(
                 self._text,
                 on_retry=on_retry,
                 private_mode=self._private_mode,
+                transform=transform,
                 should_cancel=lambda: self._cancelled or self.isInterruptionRequested(),
             )
             if self._cancelled or self.isInterruptionRequested():
@@ -313,6 +371,7 @@ class OptimizeWorker(QThread):
                         result,
                         model,
                         project_name=project_name,
+                        transform=transform,
                     )
                 except Exception:
                     log.warning("Failed to save history entry", exc_info=True)
@@ -372,7 +431,19 @@ class PillBar(QFrame):
             if child is not None:
                 w: QWidget | None = child
                 while w is not None and w is not self:
-                    if isinstance(w, (QLineEdit, QTextEdit, QPushButton, GrowingTextEdit, SelectorChip, PrivateToggleChip, PrimaryButton, PillIconButton)):
+                    if isinstance(
+                        w,
+                        (
+                            QLineEdit,
+                            QTextEdit,
+                            QPushButton,
+                            GrowingTextEdit,
+                            SelectorChip,
+                            PrivateToggleChip,
+                            TransformActionButton,
+                            PillIconButton,
+                        ),
+                    ):
                         super().mousePressEvent(event)
                         return
                     w = w.parentWidget()
@@ -455,14 +526,19 @@ class MetaPromptWindow(QWidget):
         self._collapse_key_seq = QKeySequence()
         self._hide_key_seq = QKeySequence()
         self._private_key_seq = QKeySequence()
+        self._transform_cycle_key_seq = QKeySequence()
+        self._transform_cycle_reverse_key_seq = QKeySequence()
         self._collapse_shortcut: QShortcut | None = None
         self._hide_shortcut: QShortcut | None = None
         self._private_shortcut: QShortcut | None = None
+        self._transform_shortcut: QShortcut | None = None
+        self._transform_reverse_shortcut: QShortcut | None = None
         self._rescue_shortcut: QShortcut | None = None
 
         self._voice_state: VoiceState = "idle"
         self._voice_recorder: AudioRecorder | None = None
         self._voice_worker: TranscribeWorker | None = None
+        self._voice_warmup_worker: VoiceModelWarmupWorker | None = None
         self._voice_ptt_key_seq = QKeySequence()
         self._voice_ptt_keyboard_held = False
         self._voice_toggle_timer = QTimer(self)
@@ -491,7 +567,7 @@ class MetaPromptWindow(QWidget):
         self.setMaximumWidth(WINDOW_WIDTH)
         self.resize(WINDOW_WIDTH, PILL_HEIGHT + ROOT_VERTICAL_MARGIN)
         try:
-            from main import app_icon
+            from icons import app_icon
 
             self.setWindowIcon(app_icon())
         except Exception:
@@ -513,10 +589,8 @@ class MetaPromptWindow(QWidget):
         root.setSpacing(0)
 
         # --- Pill input bar ---
-        print("TRACE: pillbar", flush=True)
         self._pill = PillBar(self)
         self._pill.set_host_window(self)
-        print("TRACE: pillbar done", flush=True)
 
         pill_layout = QVBoxLayout(self._pill)
         pill_layout.setContentsMargins(*PILL_LAYOUT_MARGINS)
@@ -526,89 +600,67 @@ class MetaPromptWindow(QWidget):
         input_row.setSpacing(10)
         input_row.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        print("TRACE: sparkicon", flush=True)
         self._pill_icon = SparkIcon(self._pill)
         input_row.addWidget(self._pill_icon, 0, Qt.AlignmentFlag.AlignTop)
-        print("TRACE: sparkicon done, growingtextedit next", flush=True)
 
         self._input = GrowingTextEdit(parent=self._pill)
-        print("TRACE: growingtextedit done", flush=True)
         self._input.setPlaceholderText(PILL_PLACEHOLDER)
-        print("TRACE: placeholder set", flush=True)
         self._input.setAccessibleName("Prompt input")
         self._input.submitRequested.connect(self._submit)
         self._input.heightChanged.connect(lambda _h: self._resize_input())
         self._input.textChanged.connect(self._on_input_changed)
         self._input.ghostDismissed.connect(self._on_ghost_dismissed)
-        print("TRACE: signals connected", flush=True)
         self._input_filter = _InputKeyFilter(self._pill, self._input)
         self._input.installEventFilter(self._input_filter)
-        print("TRACE: event filter installed", flush=True)
         input_row.addWidget(self._input, stretch=1, alignment=Qt.AlignmentFlag.AlignTop)
-        print("TRACE: input added to layout", flush=True)
 
-        print("TRACE: before audiolevelmeter", flush=True)
         self._voice_level_meter = AudioLevelMeter(self._pill)
-        print("TRACE: audiolevelmeter constructed", flush=True)
         self._voice_level_meter.hide()
         input_row.addWidget(self._voice_level_meter, 0, Qt.AlignmentFlag.AlignTop)
-        print("TRACE: audiolevelmeter added", flush=True)
 
         self._voice_status = QLabel("", self._pill)
         self._voice_status.setObjectName("voiceStatusLabel")
         self._voice_status.hide()
         input_row.addWidget(self._voice_status, 0, Qt.AlignmentFlag.AlignTop)
-        print("TRACE: voice status added", flush=True)
 
         self._mic_btn = VoiceMicButton("\U0001f3a4", self._pill)
-        print("TRACE: mic btn constructed", flush=True)
         self._mic_btn.setObjectName("voiceMicBtn")
-        print("TRACE: mic btn objectname", flush=True)
         self._mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        print("TRACE: mic btn cursor", flush=True)
         self._mic_btn.setAccessibleName("Voice input")
         self._mic_btn.setToolTip("Hold to speak (push-to-talk)")
-        print("TRACE: mic btn tooltip", flush=True)
         self._mic_btn.pressed_hold.connect(self._on_mic_pressed)
         self._mic_btn.released_hold.connect(self._on_mic_released)
-        print("TRACE: mic btn signals", flush=True)
         self._mic_btn.hide()
-        print("TRACE: mic btn hidden", flush=True)
         input_row.addWidget(self._mic_btn, 0, Qt.AlignmentFlag.AlignTop)
-        print("TRACE: mic btn added", flush=True)
 
-        pill_layout.addLayout(input_row)
-        print("TRACE: input_row added to pill_layout", flush=True)
+        self._input_row_widget = QWidget(self._pill)
+        self._input_row_widget.setObjectName("pillInputRow")
+        self._input_row_widget.setLayout(input_row)
+        pill_layout.addWidget(self._input_row_widget)
+
+        self._chip_spark = SparkIcon(self._pill)
+        self._chip_spark.setObjectName("chipSpark")
+        self._chip_spark.hide()
 
         self._progress_bar = PillProgressBar(self._pill)
-        print("TRACE: progress bar constructed", flush=True)
         self._progress_bar.hide()
         pill_layout.addWidget(self._progress_bar)
-        print("TRACE: progress bar added", flush=True)
 
         controls_row = QHBoxLayout()
         controls_row.setSpacing(8)
         controls_row.setContentsMargins(0, 0, 0, 0)
 
-        print("TRACE: before project chip", flush=True)
         self._project_chip = SelectorChip("No project", neutral=True, parent=self._pill)
-        print("TRACE: project chip constructed", flush=True)
         self._project_chip.setToolTip("Active project context")
         self._project_chip.clicked.connect(self._show_project_menu)
         controls_row.addWidget(self._project_chip, 0, Qt.AlignmentFlag.AlignVCenter)
-        print("TRACE: project chip added", flush=True)
 
         self._mode_chip = SelectorChip("Thorough", neutral=True, parent=self._pill)
-        print("TRACE: mode chip constructed", flush=True)
-        self._mode_chip.setAccessibleName("Toggle mode")
-        print("TRACE: mode chip accessiblename", flush=True)
+        self._mode_chip.setAccessibleName("Toggle speed")
         self._mode_chip.clicked.connect(self._show_mode_menu)
-        print("TRACE: mode chip connected", flush=True)
         controls_row.addWidget(self._mode_chip, 0, Qt.AlignmentFlag.AlignVCenter)
-        print("TRACE: mode chip added", flush=True)
 
         self._private_chip = PrivateToggleChip(self._pill)
-        print("TRACE: private chip constructed", flush=True)
         self._private_chip.setAccessibleName("Private session")
         self._private_chip.set_checked_silent(self._private_mode)
         self._private_chip.toggled.connect(self._set_private_mode)
@@ -631,8 +683,9 @@ class MetaPromptWindow(QWidget):
         self._settings_btn.clicked.connect(self._open_settings)
         controls_row.addWidget(self._settings_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        self._optimize_btn = PrimaryButton(self._pill)
-        self._optimize_btn.clicked.connect(self._on_optimize_clicked)
+        self._optimize_btn = TransformActionButton(self._pill)
+        self._optimize_btn.runClicked.connect(self._on_optimize_clicked)
+        self._optimize_btn.set_menu_clicked(self._show_transform_menu)
         controls_row.addWidget(self._optimize_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._controls_row = QWidget(self._pill)
@@ -662,9 +715,13 @@ class MetaPromptWindow(QWidget):
         pill_layout.addWidget(self._optimizing_row)
 
         self._refresh_project_selector()
+        self._sync_transform_from_active_project()
+        self._update_transform_button()
         self._update_mode_chip()
+        self._sync_inject_target_ui()
         self._update_control_tooltips()
         self._sync_optimize_button()
+        self._update_input_placeholder()
         self._voice_key_filter = _VoiceKeyFilter(self)
         self.installEventFilter(self._voice_key_filter)
         self._input.installEventFilter(self._voice_key_filter)
@@ -719,13 +776,21 @@ class MetaPromptWindow(QWidget):
         inject_layout = QHBoxLayout(self._inject_row)
         inject_layout.setContentsMargins(0, 0, 0, 0)
         inject_layout.setSpacing(8)
-        self._inject_label = QLabel("", self._inject_row)
-        self._inject_label.setObjectName("injectLabel")
+
+        self._inject_target_selector = InjectTargetSelector(
+            self._controller.window_service(), self._inject_row
+        )
+        self._inject_target_selector.setAccessibleName("Inject target window")
+        self._inject_target_selector.targetChanged.connect(self._on_inject_target_preference_changed)
+        self._inject_target_selector.load_preference(
+            get_inject_target_mode(), get_inject_pinned_hwnd()
+        )
+        inject_layout.addWidget(self._inject_target_selector, 1)
+
         self._inject_btn = QPushButton("Inject", self._inject_row)
         self._inject_btn.setObjectName("injectBtn")
         self._inject_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._inject_btn.clicked.connect(self._on_inject_clicked)
-        inject_layout.addWidget(self._inject_label, stretch=1)
         inject_layout.addWidget(self._inject_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self._inject_row.hide()
         result_layout.addWidget(self._inject_row)
@@ -753,6 +818,12 @@ class MetaPromptWindow(QWidget):
         if self._private_shortcut is not None:
             self._private_shortcut.deleteLater()
             self._private_shortcut = None
+        if self._transform_shortcut is not None:
+            self._transform_shortcut.deleteLater()
+            self._transform_shortcut = None
+        if self._transform_reverse_shortcut is not None:
+            self._transform_reverse_shortcut.deleteLater()
+            self._transform_reverse_shortcut = None
         if self._rescue_shortcut is not None:
             self._rescue_shortcut.deleteLater()
             self._rescue_shortcut = None
@@ -760,6 +831,10 @@ class MetaPromptWindow(QWidget):
         self._collapse_key_seq = key_sequence_from_string(get_shortcut_collapse())
         self._hide_key_seq = key_sequence_from_string(get_shortcut_hide_tray())
         self._private_key_seq = key_sequence_from_string(get_shortcut_private())
+        self._transform_cycle_key_seq = key_sequence_from_string(get_shortcut_transform_cycle())
+        self._transform_cycle_reverse_key_seq = key_sequence_from_string(
+            get_shortcut_transform_cycle_reverse()
+        )
 
         if not self._collapse_key_seq.isEmpty():
             collapse = QShortcut(self._collapse_key_seq, self)
@@ -778,6 +853,18 @@ class MetaPromptWindow(QWidget):
             private.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             private.activated.connect(self._toggle_private_mode)
             self._private_shortcut = private
+
+        if not self._transform_cycle_key_seq.isEmpty():
+            transform = QShortcut(self._transform_cycle_key_seq, self)
+            transform.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            transform.activated.connect(self._cycle_transform)
+            self._transform_shortcut = transform
+
+        if not self._transform_cycle_reverse_key_seq.isEmpty():
+            transform_reverse = QShortcut(self._transform_cycle_reverse_key_seq, self)
+            transform_reverse.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            transform_reverse.activated.connect(self._cycle_transform_reverse)
+            self._transform_reverse_shortcut = transform_reverse
 
         self._update_control_tooltips()
 
@@ -814,6 +901,17 @@ class MetaPromptWindow(QWidget):
         else:
             self._mic_btn.setEnabled(True)
         self._update_voice_ui()
+        if enabled and voice_deps_available():
+            self._warm_voice_model()
+
+    def _warm_voice_model(self) -> None:
+        if self._voice_state != "idle":
+            return
+        worker = self._voice_warmup_worker
+        if worker is not None and worker.isRunning():
+            return
+        self._voice_warmup_worker = VoiceModelWarmupWorker(get_voice_model_size())
+        self._voice_warmup_worker.start()
 
     def _voice_can_start(self) -> bool:
         return (
@@ -958,12 +1056,23 @@ class MetaPromptWindow(QWidget):
         self._update_voice_ui()
         model_size = get_voice_model_size()
         self._voice_worker = TranscribeWorker(audio, model_size=model_size)
+        self._voice_worker.download_progress.connect(self._on_voice_download_progress)
         self._voice_worker.finished.connect(self._on_transcribe_done)
         self._voice_worker.start()
 
+    def _on_voice_download_progress(self, current: int, total: int) -> None:
+        if self._voice_state != "transcribing":
+            return
+        if total <= 0 or current >= total:
+            self._voice_status.setText("Transcribing…")
+        else:
+            pct = max(0, min(100, int(100 * current / total)))
+            self._voice_status.setText(f"Loading model… {pct}%")
+        self._voice_status.show()
+
     def _cancel_voice_transcription(self) -> None:
         if self._voice_worker is not None and self._voice_worker.isRunning():
-            self._voice_worker.requestInterruption()
+            self._voice_worker.cancel()
         self._voice_worker = None
         self._voice_state = "idle"
         self._update_voice_ui()
@@ -1034,6 +1143,9 @@ class MetaPromptWindow(QWidget):
     def _sync_optimize_button(self) -> None:
         self._optimize_btn.set_has_text(self._input.has_substantive_text())
 
+    def _update_input_placeholder(self) -> None:
+        self._input.setPlaceholderText(placeholder_for(get_effective_transform()))
+
     def _on_optimize_clicked(self) -> None:
         if not self._input.has_substantive_text():
             self._input.setFocus()
@@ -1082,7 +1194,42 @@ class MetaPromptWindow(QWidget):
     def _show_pill_menu(self, pos: QPoint) -> None:
         menu = QMenu(self)
         menu.setStyleSheet(pill_menu_stylesheet())
-        mode_action = menu.addAction(f"Mode: {self._mode_label().title()}")
+
+        transform_menu = menu.addMenu(
+            f"Transform: {menu_label(get_effective_transform())}"
+        )
+        current_transform = get_effective_transform()
+        for transform_id in TRANSFORM_CYCLE_ORDER:
+            label = menu_label(transform_id)
+            action = transform_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(transform_id == current_transform)
+
+            def _make_transform_handler(mode_id: str) -> Callable[[], None]:
+                return lambda: self._select_transform(mode_id)
+
+            action.triggered.connect(_make_transform_handler(transform_id))
+        cycle_transform = menu.addAction("Cycle transform forward")
+        cycle_hint = self._shortcut_hint(self._transform_cycle_key_seq)
+        if cycle_hint.strip():
+            cycle_transform.setShortcut(
+                self._transform_cycle_key_seq.toString(QKeySequence.SequenceFormat.PortableText)
+            )
+        cycle_transform.triggered.connect(self._cycle_transform)
+
+        cycle_back = menu.addAction("Cycle transform backward")
+        reverse_hint = self._shortcut_hint(self._transform_cycle_reverse_key_seq)
+        if reverse_hint.strip():
+            cycle_back.setShortcut(
+                self._transform_cycle_reverse_key_seq.toString(
+                    QKeySequence.SequenceFormat.PortableText
+                )
+            )
+        cycle_back.triggered.connect(self._cycle_transform_reverse)
+
+        menu.addSeparator()
+
+        mode_action = menu.addAction(f"Speed: {self._mode_label().title()}")
         mode_action.setShortcut("Ctrl+M")
         mode_action.triggered.connect(self._toggle_mode)
 
@@ -1166,6 +1313,38 @@ class MetaPromptWindow(QWidget):
         self.setFixedSize(CHIP_WINDOW_SIZE, CHIP_WINDOW_SIZE)
         self.updateGeometry()
 
+    def _position_chip_spark(self) -> None:
+        """Center the chip-only spark icon within the collapsed pill."""
+        x = (self._pill.width() - SparkIcon.SIZE) // 2
+        y = (self._pill.height() - SparkIcon.SIZE) // 2
+        self._chip_spark.setGeometry(x, y, SparkIcon.SIZE, SparkIcon.SIZE)
+
+    def _set_pill_expanded_content_visible(self, visible: bool) -> None:
+        """Show or hide all expanded-pill widgets (chip mode uses _chip_spark only)."""
+        self._input_row_widget.setVisible(visible)
+        self._controls_row.setVisible(visible)
+        if not visible:
+            self._optimizing_row.hide()
+            self._progress_bar.hide()
+
+    def _enter_chip_appearance(self) -> None:
+        """Switch to chip-only rendering — prevents expanded widgets bleeding through."""
+        self._set_pill_expanded_content_visible(False)
+        self._position_chip_spark()
+        self._chip_spark.show()
+        self._chip_spark.raise_()
+        self._pill.update()
+        self.update()
+
+    def _leave_chip_appearance(self) -> None:
+        """Restore expanded pill widgets after leaving chip mode."""
+        self._chip_spark.hide()
+        self._set_pill_expanded_content_visible(True)
+        self._optimizing_row.hide()
+        self._progress_bar.hide()
+        self._pill.update()
+        self.update()
+
     def _release_chip_geometry(self) -> None:
         """Clear chip-only size constraints before restoring the expanded pill."""
         self._pill.setMinimumSize(0, 0)
@@ -1191,6 +1370,51 @@ class MetaPromptWindow(QWidget):
         if self.height() != total_h:
             self.setFixedHeight(total_h)
 
+    def _sync_transform_from_active_project(self) -> None:
+        """Apply the active project's default transform to the session."""
+        active = get_active_project()
+        if not active:
+            return
+        try:
+            set_transform(str(active.get("default_transform") or "optimize"))
+        except ValueError:
+            pass
+
+    def _cycle_transform(self) -> None:
+        if self._busy:
+            return
+        new_transform = next_transform(get_effective_transform())
+        self._select_transform(new_transform)
+
+    def _cycle_transform_reverse(self) -> None:
+        if self._busy:
+            return
+        new_transform = previous_transform(get_effective_transform())
+        self._select_transform(new_transform)
+
+    def _select_transform(self, transform_id: str) -> None:
+        if self._busy:
+            return
+        try:
+            set_transform(transform_id)
+        except ValueError:
+            return
+        self._flash_status(f"Transform: {action_label(transform_id)}")
+        self._update_transform_button()
+
+    def _update_transform_button(self) -> None:
+        label = action_label(get_effective_transform())
+        self._optimize_btn.set_action_label(label)
+        self._sync_optimize_button()
+        self._update_input_placeholder()
+        self._update_control_tooltips()
+
+    def reload_transform_ui(self) -> None:
+        """Refresh transform button after settings or project changes."""
+        if get_active_project():
+            self._sync_transform_from_active_project()
+        self._update_transform_button()
+
     def _mode_label(self) -> str:
         mode = (load_config().get("mode") or "thorough").lower()
         return "fast" if mode == "fast" else "thorough"
@@ -1204,7 +1428,7 @@ class MetaPromptWindow(QWidget):
             set_mode(new_mode)
         except ValueError:
             return
-        self._flash_status(f"Mode: {self._mode_label().title()}")
+        self._flash_status(f"Speed: {self._mode_label().title()}")
         self._update_mode_chip()
 
     def _update_mode_chip(self) -> None:
@@ -1228,6 +1452,24 @@ class MetaPromptWindow(QWidget):
             action.triggered.connect(_make_handler(label))
         menu.exec(self._mode_chip.mapToGlobal(QPoint(0, self._mode_chip.height())))
 
+    def _show_transform_menu(self) -> None:
+        if self._busy:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(pill_menu_stylesheet())
+        current = get_effective_transform()
+        for transform_id in TRANSFORM_CYCLE_ORDER:
+            label = menu_label(transform_id)
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(transform_id == current)
+
+            def _make_handler(mode_id: str) -> Callable[[], None]:
+                return lambda: self._select_transform(mode_id)
+
+            action.triggered.connect(_make_handler(transform_id))
+        menu.exec(self._optimize_btn.menu_anchor_global())
+
     def _select_mode(self, mode_label: str) -> None:
         if self._busy:
             return
@@ -1235,7 +1477,7 @@ class MetaPromptWindow(QWidget):
             set_mode(mode_label.lower())
         except ValueError:
             return
-        self._flash_status(f"Mode: {self._mode_label().title()}")
+        self._flash_status(f"Speed: {self._mode_label().title()}")
         self._update_mode_chip()
         self._update_control_tooltips()
 
@@ -1246,10 +1488,22 @@ class MetaPromptWindow(QWidget):
         return f" ({native})" if native else ""
 
     def _update_control_tooltips(self) -> None:
+        transform = menu_label(get_effective_transform())
+        cycle_hint = self._shortcut_hint(self._transform_cycle_key_seq).strip()
+        reverse_hint = self._shortcut_hint(self._transform_cycle_reverse_key_seq).strip()
+        menu_parts = ["Click to choose transform mode"]
+        if cycle_hint:
+            menu_parts.append(f"cycle forward{cycle_hint}")
+        if reverse_hint:
+            menu_parts.append(f"cycle back{reverse_hint}")
+        self._optimize_btn.set_tooltips(
+            f"Run: {transform} (Ctrl+Enter)",
+            " — ".join(menu_parts),
+        )
         mode = self._mode_label().title()
         other = "Fast" if mode == "Thorough" else "Thorough"
         self._mode_chip.setToolTip(
-            f"Mode: {mode} — click for {other} (Ctrl+M)"
+            f"Speed: {mode} — click for {other} (Ctrl+M)"
         )
         private_hint = self._shortcut_hint(self._private_key_seq)
         self._private_chip.setToolTip(
@@ -1318,11 +1572,16 @@ class MetaPromptWindow(QWidget):
             set_active_project(project_id)
         except ValueError:
             return
-        self._refresh_project_selector()
         if project_id:
             project = get_active_project()
             if project:
+                try:
+                    set_transform(str(project.get("default_transform") or "optimize"))
+                except ValueError:
+                    pass
                 self._flash_status(f"Project: {project.get('name')}")
+        self._refresh_project_selector()
+        self._update_transform_button()
 
     def _open_projects_settings_new(self) -> None:
         self._controller.show_settings(initial_tab="projects", new_project=True)
@@ -1330,6 +1589,8 @@ class MetaPromptWindow(QWidget):
     def reload_project_selector(self) -> None:
         """Refresh project label after settings changes."""
         self._refresh_project_selector()
+        self._sync_transform_from_active_project()
+        self._update_transform_button()
 
     def refresh_projects(self) -> None:
         """Alias for reload_project_selector (settings save callback)."""
@@ -1355,7 +1616,9 @@ class MetaPromptWindow(QWidget):
                 return
 
         if get_auto_inject_enabled():
-            self._controller.refresh_inject_target()
+            existing = self._controller.get_inject_target()
+            if not can_inject_target(existing, own_hwnd=self._own_hwnd()):
+                self._controller.resolve_inject_target(refresh_dynamic=True)
 
         self._pending_optimize_text = text
         self._set_busy(True)
@@ -1371,10 +1634,11 @@ class MetaPromptWindow(QWidget):
 
     def _show_optimizing_ui(self) -> None:
         model_id = get_active_model()
+        verb = progress_verb(get_effective_transform())
         self._pill_status.setProperty("danger", "false")
         self._pill_status.style().unpolish(self._pill_status)
         self._pill_status.style().polish(self._pill_status)
-        self._pill_status.setText(f"Optimizing with {model_id}")
+        self._pill_status.setText(f"{verb} with {model_id}")
         self._settings_link_btn.hide()
         self._controls_row.hide()
         self._optimizing_row.show()
@@ -1420,11 +1684,32 @@ class MetaPromptWindow(QWidget):
             return "", False
         if "api key" in lower or "no api key" in lower:
             return "No API key set.", True
-        if "rate limit" in lower or "busy" in lower or "429" in lower:
+        if is_rate_limit_error(error):
+            if self._mode_label() == "thorough":
+                return "Rate limited. Try Fast mode?", False
             return "Rate limited. Wait a moment and try again.", False
         if "authentication" in lower:
             return "Authentication failed. Check your API key in settings.", True
         return "Optimization failed. Try again.", False
+
+    def _offer_switch_to_fast_mode(self) -> None:
+        """Prompt to switch from Thorough to Fast after rate limiting."""
+        if self._mode_label() != "thorough":
+            return
+
+        if not RateLimitDialog.prompt_switch_to_fast(self):
+            return
+
+        try:
+            set_mode("fast")
+        except ValueError:
+            return
+        self._update_mode_chip()
+        self._flash_status("Speed: Fast")
+
+        retry_text = (self._pending_optimize_text or self._input.effective_text()).strip()
+        if retry_text and not self._busy:
+            QTimer.singleShot(150, self._submit)
 
     def _on_optimize_progress(self, message: str) -> None:
         if message:
@@ -1459,7 +1744,9 @@ class MetaPromptWindow(QWidget):
             self._show_controls_ui()
         else:
             error = payload.get("error") or "Unknown error"
-            message, opens_settings = self._format_optimize_error(str(error))
+            error_text = str(error)
+            message, opens_settings = self._format_optimize_error(error_text)
+            rate_limited = is_rate_limit_error(error_text)
             self._progress_bar.flash_danger()
             QTimer.singleShot(200, lambda: self._progress_fade_timer.start(400))
             if message:
@@ -1473,7 +1760,9 @@ class MetaPromptWindow(QWidget):
                 QTimer.singleShot(2500, self._hide_progress_bar)
             else:
                 self._hide_progress_bar()
-            self._result_text.setPlainText(str(error))
+            if rate_limited and self._mode_label() == "thorough":
+                QTimer.singleShot(0, self._offer_switch_to_fast_mode)
+            self._result_text.setPlainText(error_text)
             self._status_label.setText("Error")
             self._status_label.setStyleSheet(f"color: {C['danger']}; font-size: 12px;")
             self._hide_inject_row()
@@ -1491,16 +1780,61 @@ class MetaPromptWindow(QWidget):
             return None
 
     def _update_inject_row(self) -> None:
-        self._hide_inject_row()
         if not get_auto_inject_enabled():
+            self._hide_inject_row()
             return
+
+        own = self._own_hwnd()
+        if not self._controller.has_active_user_selection(own_hwnd=own):
+            if not can_inject_target(self._controller.get_inject_target(), own_hwnd=own):
+                self._controller.resolve_inject_target(refresh_dynamic=False)
+            if not can_inject_target(self._controller.get_inject_target(), own_hwnd=own):
+                self._controller.resolve_inject_target(refresh_dynamic=True)
+
+        self._refresh_inject_row_ui()
+
+    def _refresh_inject_row_ui(self) -> None:
+        """Update inject row labels/button state from the current controller target."""
         target = self._controller.get_inject_target()
-        if not can_inject_target(target, own_hwnd=self._own_hwnd()):
-            return
-        title = str((target or {}).get("title") or "Unknown window")
-        self._inject_label.setText(f'Inject into: "{title}"')
+        has_target = can_inject_target(target, own_hwnd=self._own_hwnd())
+        mode = get_inject_target_mode()
+        if mode == INJECT_TARGET_PINNED and get_inject_pinned_hwnd():
+            self._inject_target_selector.load_preference(mode, get_inject_pinned_hwnd())
+        else:
+            self._inject_target_selector.reflect_resolved_target(target, mode=mode)
+        self._inject_btn.setEnabled(has_target)
         self._inject_row.show()
         self._update_window_height()
+
+    def _sync_inject_target_ui(self) -> None:
+        if not hasattr(self, "_inject_target_selector"):
+            return
+        self._inject_target_selector.load_preference(
+            get_inject_target_mode(), get_inject_pinned_hwnd()
+        )
+        if self._result_expanded and get_auto_inject_enabled():
+            self._update_inject_row()
+
+    def _on_inject_target_preference_changed(self, mode: str, info: object) -> None:
+        set_inject_target_mode(mode)
+        if mode == INJECT_TARGET_PINNED and info is not None:
+            target = {
+                "hwnd": int(info["hwnd"]),  # type: ignore[index]
+                "title": str(info.get("title") or "Window"),  # type: ignore[union-attr]
+                "process_name": str(info.get("process_name") or ""),  # type: ignore[union-attr]
+            }
+            set_inject_pinned_hwnd(int(target["hwnd"]))
+            self._controller.set_inject_target(target, user_selected=True)
+            self._flash_status(f"Inject target: {target['title']}")
+        else:
+            set_inject_pinned_hwnd(None)
+            self._controller.clear_user_selection()
+            resolved = self._controller.resolve_inject_target(refresh_dynamic=True)
+            if resolved.get("title"):
+                self._flash_status(f"Inject target: {resolved['title']}")
+            else:
+                self._flash_status("Using last active window when available")
+        self._refresh_inject_row_ui()
 
     def _hide_inject_row(self) -> None:
         if self._inject_row.isVisible():
@@ -1508,23 +1842,25 @@ class MetaPromptWindow(QWidget):
             self._update_window_height()
 
     def _on_inject_clicked(self) -> None:
+        if not self._inject_btn.isEnabled():
+            return
         target = self._controller.get_inject_target()
         if not target:
-            self._flash_status("No inject target available. Use clipboard instead.")
-            self._hide_inject_row()
+            self._flash_status("No inject target — pick a window from the list.")
+            self._refresh_inject_row_ui()
             return
 
         hwnd = target.get("hwnd")
         title = target.get("title")
         process_name = target.get("process_name")
         if not is_target_valid(hwnd):
-            self._flash_status("Target window is no longer available. Use clipboard instead.")
-            self._hide_inject_row()
+            self._flash_status("Target window closed. Pick another window.")
             self._controller.clear_inject_target()
+            self._refresh_inject_row_ui()
             return
         if is_blocked_target(title, process_name):
             self._flash_status("Cannot inject into this target.")
-            self._hide_inject_row()
+            self._refresh_inject_row_ui()
             return
 
         text = self._result_text.toPlainText()
@@ -1534,11 +1870,11 @@ class MetaPromptWindow(QWidget):
             ok, message = inject_via_paste(int(hwnd), text)
             self._inject_btn.setEnabled(True)
             if ok:
-                self._controller.clear_inject_target()
-                self._hide_inject_row()
-                self.collapse()
+                self._flash_status("Pasted — inject again if needed.")
+                self._refresh_inject_row_ui()
             else:
                 self._flash_status(message)
+                self._refresh_inject_row_ui()
 
         QTimer.singleShot(INJECT_DEFER_MS, _do_inject)
 
@@ -1596,11 +1932,6 @@ class MetaPromptWindow(QWidget):
         self._pill_collapsed = True
         self._result_frame.hide()
 
-        self._input.hide()
-        self._progress_bar.hide()
-        self._controls_row.hide()
-        self._optimizing_row.hide()
-
         self._pill.setProperty("collapsed", "true")
         self._pill.style().unpolish(self._pill)
         self._pill.style().polish(self._pill)
@@ -1610,8 +1941,8 @@ class MetaPromptWindow(QWidget):
             pill_layout.setContentsMargins(0, 0, 0, 0)
             pill_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self._pill_icon.setFixedSize(SparkIcon.SIZE, SparkIcon.SIZE)
         self._apply_chip_geometry()
+        self._enter_chip_appearance()
         x, y = self.x(), self.y()
         self._move_clamped(x, y)
 
@@ -1635,13 +1966,8 @@ class MetaPromptWindow(QWidget):
             pill_layout.setContentsMargins(*PILL_LAYOUT_MARGINS)
             pill_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        self._pill_icon.setFixedSize(SparkIcon.SIZE, SparkIcon.SIZE)
-        self._input.show()
-        self._controls_row.show()
-        self._optimizing_row.hide()
-        self._progress_bar.hide()
-
         self._release_chip_geometry()
+        self._leave_chip_appearance()
         if self.width() < WINDOW_MIN_WIDTH:
             self.resize(WINDOW_WIDTH, self.height())
         self._resize_input()
@@ -1864,6 +2190,7 @@ class MetaPromptWindow(QWidget):
             self.collapse()
         else:
             self._apply_chip_geometry()
+            self._enter_chip_appearance()
 
         self._apply_saved_position()
         self.validate_window_position()
@@ -1881,6 +2208,8 @@ class MetaPromptWindow(QWidget):
         self.flush_draft()
         self._position_save_timer.stop()
         self._persist_window_position()
+        if self._pill_collapsed:
+            self._enter_chip_appearance()
         if self._session_has_optimization_result:
             self.collapse_result(reset_ui=True)
         else:
@@ -1907,7 +2236,14 @@ class MetaPromptWindow(QWidget):
 
     def showEvent(self, event) -> None:  # noqa: ANN001, N802
         super().showEvent(event)
+        if self._pill_collapsed:
+            self._enter_chip_appearance()
         self._schedule_resize_input()
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001, N802
+        super().resizeEvent(event)
+        if self._pill_collapsed:
+            self._position_chip_spark()
 
     def toggle_popup(self, *, record_inject_target: bool = True) -> None:
         if self._visible and self.isVisible():
@@ -1999,6 +2335,8 @@ class PopupController(QObject):
     _reset_position_signal = pyqtSignal()
     _validate_position_signal = pyqtSignal()
     _quit_signal = pyqtSignal()
+    _toggle_from_hotkey_signal = pyqtSignal()
+    _toggle_collapse_global_from_hotkey_signal = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -2011,20 +2349,38 @@ class PopupController(QObject):
         self._settings_new_project = False
         self._inject_target: dict[str, Any] | None = None
         self._inject_target_from_hotkey = False
+        self._user_selected_target: dict[str, Any] | None = None
+        self._window_service = WindowService()
+        self._show_expanded_capture_inject = True
 
-        self._show_signal.connect(self._show_main_thread)
-        self._hide_signal.connect(self._hide_main_thread)
-        self._toggle_signal.connect(self._toggle_main_thread)
-        self._toggle_collapse_global_signal.connect(self._toggle_collapse_global_main_thread)
-        self._show_expanded_signal.connect(self._show_expanded_main_thread)
-        self._history_signal.connect(self._show_history_main_thread)
-        self._settings_signal.connect(self._show_settings_main_thread)
-        self._reset_position_signal.connect(self._reset_window_position_main_thread)
-        self._validate_position_signal.connect(self._validate_window_position_main_thread)
+        self._show_signal.connect(self._show_main_thread, Qt.ConnectionType.QueuedConnection)
+        self._hide_signal.connect(self._hide_main_thread, Qt.ConnectionType.QueuedConnection)
+        self._toggle_signal.connect(self._toggle_main_thread, Qt.ConnectionType.QueuedConnection)
+        self._toggle_collapse_global_signal.connect(
+            self._toggle_collapse_global_main_thread, Qt.ConnectionType.QueuedConnection
+        )
+        self._show_expanded_signal.connect(
+            self._show_expanded_main_thread, Qt.ConnectionType.QueuedConnection
+        )
+        self._history_signal.connect(self._show_history_main_thread, Qt.ConnectionType.QueuedConnection)
+        self._settings_signal.connect(self._show_settings_main_thread, Qt.ConnectionType.QueuedConnection)
+        self._reset_position_signal.connect(
+            self._reset_window_position_main_thread, Qt.ConnectionType.QueuedConnection
+        )
+        self._validate_position_signal.connect(
+            self._validate_window_position_main_thread, Qt.ConnectionType.QueuedConnection
+        )
+        self._quit_signal.connect(self._quit_main_thread, Qt.ConnectionType.QueuedConnection)
+        self._toggle_from_hotkey_signal.connect(
+            self._toggle_from_hotkey_main_thread, Qt.ConnectionType.QueuedConnection
+        )
+        self._toggle_collapse_global_from_hotkey_signal.connect(
+            self._toggle_collapse_global_from_hotkey_main_thread,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     def set_quit_callback(self, cb: Callable[[], None]) -> None:
         self._on_quit = cb
-        self._quit_signal.connect(cb)
 
     def set_settings_saved_callback(self, cb: Callable[[], None]) -> None:
         self._on_settings_saved = cb
@@ -2033,6 +2389,12 @@ class PopupController(QObject):
         """Thread-safe quit entry (tray menu, hotkeys, etc.)."""
         log.info("Quit requested (marshaling to main thread)")
         self._quit_signal.emit()
+
+    @pyqtSlot()
+    def _quit_main_thread(self) -> None:
+        log.info("Quit handler running on main thread")
+        if self._on_quit is not None:
+            self._on_quit()
 
     def create_window(self) -> MetaPromptWindow:
         self.window = MetaPromptWindow(self)
@@ -2047,38 +2409,92 @@ class PopupController(QObject):
         except Exception:
             return frozenset()
 
-    def record_inject_target_from_hotkey(self) -> None:
-        """Capture foreground window on the hotkey thread before the pill is shown."""
-        from inject import record_foreground_target
+    def window_service(self) -> WindowService:
+        self._window_service.set_exclude_hwnds(self._exclude_hwnds())
+        return self._window_service
 
-        target = record_foreground_target(exclude_hwnds=self._exclude_hwnds())
-        self._inject_target = target or None
-        self._inject_target_from_hotkey = bool(self._inject_target)
+    def _inject_preference(self) -> InjectTargetPreference:
+        project = get_active_project()
+        project_process = None
+        if project:
+            raw = str(project.get("inject_process") or "").strip()
+            project_process = raw or None
+        return InjectTargetPreference(
+            mode=get_inject_target_mode(),
+            pinned_hwnd=get_inject_pinned_hwnd(),
+            project_process=project_process,
+        )
 
-    def refresh_inject_target(self) -> None:
-        """Re-capture the foreground window (e.g. immediately before optimize)."""
-        from inject import record_foreground_target
+    def resolve_inject_target(self, *, refresh_dynamic: bool = True) -> dict[str, Any]:
+        """Resolve inject target from project binding, pinned window, or foreground."""
+        own_hwnd: int | None = None
+        if self.window is not None:
+            own_hwnd = self.window._own_hwnd()
 
-        target = record_foreground_target(exclude_hwnds=self._exclude_hwnds())
+        if self._user_selected_target and can_inject_target(
+            self._user_selected_target, own_hwnd=own_hwnd
+        ):
+            self._inject_target = self._user_selected_target
+            return self._user_selected_target
+
+        prior = self._inject_target
+        target = self.window_service().resolve_inject_target(
+            self._inject_preference(),
+            own_hwnd=own_hwnd,
+            refresh_dynamic=refresh_dynamic,
+        )
         if target:
             self._inject_target = target
-            self._inject_target_from_hotkey = False
+            return target
+        if prior and can_inject_target(prior, own_hwnd=own_hwnd):
+            self._inject_target = prior
+            return prior
+        self._inject_target = None
+        return {}
+
+    def set_inject_target(
+        self,
+        target: dict[str, Any] | None,
+        *,
+        user_selected: bool = False,
+    ) -> None:
+        self._inject_target = target or None
+        if user_selected and target:
+            self._user_selected_target = dict(target)
+        elif not user_selected and target is None:
+            self._user_selected_target = None
+
+    def clear_user_selection(self) -> None:
+        self._user_selected_target = None
+
+    def has_active_user_selection(self, *, own_hwnd: int | None = None) -> bool:
+        return bool(
+            self._user_selected_target
+            and can_inject_target(self._user_selected_target, own_hwnd=own_hwnd)
+        )
+
+    def record_inject_target_from_hotkey(self) -> None:
+        """Capture inject target on hotkey — respects pinned/project preferences."""
+        target = self.resolve_inject_target(refresh_dynamic=True)
+        self._inject_target_from_hotkey = bool(target) and get_inject_target_mode() == INJECT_TARGET_DYNAMIC
+
+    def refresh_inject_target(self) -> None:
+        """Re-resolve inject target (e.g. immediately before optimize)."""
+        self.resolve_inject_target(refresh_dynamic=True)
 
     def record_inject_target_if_needed(self) -> None:
         """Capture foreground window when opening via tray/history (not hotkey)."""
         if self._inject_target_from_hotkey:
             self._inject_target_from_hotkey = False
             return
-        from inject import record_foreground_target
-
-        target = record_foreground_target(exclude_hwnds=self._exclude_hwnds())
-        self._inject_target = target or None
+        self.resolve_inject_target(refresh_dynamic=True)
 
     def get_inject_target(self) -> dict[str, Any] | None:
         return self._inject_target
 
     def clear_inject_target(self) -> None:
         self._inject_target = None
+        self._user_selected_target = None
         self._inject_target_from_hotkey = False
 
     def show(self) -> None:
@@ -2093,9 +2509,17 @@ class PopupController(QObject):
 
     def toggle_from_hotkey(self) -> None:
         """Global hotkey: record foreground target before showing the pill."""
-        if not self.is_visible:
+        self._toggle_from_hotkey_signal.emit()
+
+    @pyqtSlot()
+    def _toggle_from_hotkey_main_thread(self) -> None:
+        with self._lock:
+            if self.window is None:
+                return
+            visible = bool(self.window._visible and self.window.isVisible())
+        if not visible:
             self.record_inject_target_from_hotkey()
-        self.toggle()
+        self._toggle_main_thread()
 
     def toggle_collapse_global(self) -> None:
         """Thread-safe: global collapse/expand chip hotkey."""
@@ -2103,16 +2527,22 @@ class PopupController(QObject):
 
     def toggle_collapse_global_from_hotkey(self) -> None:
         """Global collapse hotkey: record target only when showing from hidden."""
-        with self._lock:
-            if self.window is not None:
-                action = collapse_global_action(
-                    is_visible=bool(self.window._visible and self.window.isVisible()),
-                    is_collapsed=self.window._pill_collapsed,
-                )
-                if action == "show_chip":
-                    self.record_inject_target_from_hotkey()
-        self.toggle_collapse_global()
+        self._toggle_collapse_global_from_hotkey_signal.emit()
 
+    @pyqtSlot()
+    def _toggle_collapse_global_from_hotkey_main_thread(self) -> None:
+        with self._lock:
+            if self.window is None:
+                return
+            action = collapse_global_action(
+                is_visible=bool(self.window._visible and self.window.isVisible()),
+                is_collapsed=self.window._pill_collapsed,
+            )
+        if action == "show_chip":
+            self.record_inject_target_from_hotkey()
+        self._toggle_collapse_global_main_thread()
+
+    @pyqtSlot()
     def _show_main_thread(self) -> None:
         with self._lock:
             if self.window is None:
@@ -2121,6 +2551,7 @@ class PopupController(QObject):
             self._inject_target_from_hotkey = False
             self._visible = True
 
+    @pyqtSlot()
     def _hide_main_thread(self) -> None:
         with self._lock:
             if self.window is None:
@@ -2128,6 +2559,7 @@ class PopupController(QObject):
             self.window.hide_popup()
             self._visible = False
 
+    @pyqtSlot()
     def _toggle_main_thread(self) -> None:
         with self._lock:
             if self.window is None:
@@ -2136,6 +2568,7 @@ class PopupController(QObject):
             self._inject_target_from_hotkey = False
             self._visible = self.window._visible
 
+    @pyqtSlot()
     def _toggle_collapse_global_main_thread(self) -> None:
         with self._lock:
             if self.window is None:
@@ -2144,7 +2577,21 @@ class PopupController(QObject):
             self._inject_target_from_hotkey = False
             self._visible = self.window._visible
 
+    @pyqtSlot()
     def _show_expanded_main_thread(self) -> None:
+        with self._lock:
+            if self.window is None:
+                return
+            window = self.window
+            already_visible = bool(window._visible and window.isVisible())
+
+        if (
+            not already_visible
+            and self._show_expanded_capture_inject
+            and not self._inject_target_from_hotkey
+        ):
+            self.record_inject_target_if_needed()
+
         with self._lock:
             if self.window is None:
                 return
@@ -2156,6 +2603,7 @@ class PopupController(QObject):
                     self.window.raise_()
                     self.window.activateWindow()
                     self.window._input.setFocus()
+                log.debug("Popup already visible; raised/focused")
                 return
             self.window.show_popup(
                 force_expand=True,
@@ -2163,6 +2611,7 @@ class PopupController(QObject):
             )
             self._inject_target_from_hotkey = False
             self._visible = self.window._visible
+        log.info("Popup shown expanded")
 
     def collapse(self, reset_ui: bool = False) -> None:
         if self.window:
@@ -2181,8 +2630,7 @@ class PopupController(QObject):
 
     def show_expanded(self, *, capture_inject_target: bool = True) -> None:
         """Thread-safe: show popup expanded or expand from chip."""
-        if capture_inject_target:
-            self.record_inject_target_from_hotkey()
+        self._show_expanded_capture_inject = capture_inject_target
         self._show_expanded_signal.emit()
 
     def show_history(self) -> None:
@@ -2208,14 +2656,17 @@ class PopupController(QObject):
         """Center popup on primary screen (thread-safe)."""
         self._reset_position_signal.emit()
 
+    @pyqtSlot()
     def _validate_window_position_main_thread(self) -> None:
         if self.window is not None:
             self.window.validate_window_position()
 
+    @pyqtSlot()
     def _reset_window_position_main_thread(self) -> None:
         if self.window is not None:
             self.window.reset_window_position()
 
+    @pyqtSlot()
     def _show_history_main_thread(self) -> None:
         if self.window is None:
             return
@@ -2227,6 +2678,7 @@ class PopupController(QObject):
         dlg.rerun_requested.connect(self._on_history_rerun)
         dlg.exec()
 
+    @pyqtSlot()
     def _show_settings_main_thread(self) -> None:
         if self.window is None:
             return
@@ -2246,7 +2698,9 @@ class PopupController(QObject):
         if self.window is not None:
             self.window.reload_project_selector()
             self.window.reload_private_session()
+            self.window.reload_transform_ui()
             self.window._reload_voice_settings()
+            self.window._sync_inject_target_ui()
         if self._on_settings_saved is not None:
             self._on_settings_saved()
 
@@ -2303,5 +2757,21 @@ class PopupController(QObject):
         return self._visible
 
 
-# Singleton used by main.py
-controller = PopupController()
+# Singleton created by main.py after QApplication exists.
+_controller: PopupController | None = None
+
+
+def init_controller() -> PopupController:
+    """Create the shared popup controller (must run after QApplication)."""
+    global _controller
+    if _controller is None:
+        if QApplication.instance() is None:
+            raise RuntimeError("init_controller() requires an active QApplication")
+        _controller = PopupController()
+    return _controller
+
+
+def get_controller() -> PopupController:
+    if _controller is None:
+        raise RuntimeError("Popup controller not initialized")
+    return _controller

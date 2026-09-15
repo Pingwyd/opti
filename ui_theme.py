@@ -118,7 +118,7 @@ def pill_stylesheet() -> str:
             border: none;
             color: {TEXT_PRIMARY};
             font-size: {F["size_base"]}px;
-            padding: 0;
+            padding: 1px 0 3px 0;
             selection-background-color: {CORAL_TINT_HOVER};
         }}
         QTextEdit#growingPromptInput:disabled {{
@@ -140,15 +140,56 @@ def pill_stylesheet() -> str:
             background: {INPUT_BG};
             color: {TEXT_DISABLED};
             border: 1px solid {BORDER_CONTROL};
-            border-radius: 6px;
+            border-right: none;
+            border-top-left-radius: 6px;
+            border-bottom-left-radius: 6px;
+            border-top-right-radius: 0px;
+            border-bottom-right-radius: 0px;
             padding: 5px 12px;
             font-size: {F["size_sm"]}px;
+        }}
+        QPushButton#pillOptimizeMenuBtn[inactive="true"] {{
+            background: {INPUT_BG};
+            color: {TEXT_DISABLED};
+            border: 1px solid {BORDER_CONTROL};
+            border-left: none;
+            border-top-right-radius: 6px;
+            border-bottom-right-radius: 6px;
+            border-top-left-radius: 0px;
+            border-bottom-left-radius: 0px;
+            padding: 5px 4px;
+            font-size: {F["size_sm"]}px;
+            min-width: 22px;
+            max-width: 22px;
+        }}
+        QPushButton#pillOptimizeMenuBtn[inactive="false"] {{
+            background: {CORAL};
+            color: {CORAL_ON};
+            border: none;
+            border-left: 1px solid rgba(255, 255, 255, 0.18);
+            border-top-right-radius: 6px;
+            border-bottom-right-radius: 6px;
+            border-top-left-radius: 0px;
+            border-bottom-left-radius: 0px;
+            padding: 5px 4px;
+            font-size: {F["size_sm"]}px;
+            min-width: 22px;
+            max-width: 22px;
+        }}
+        QPushButton#pillOptimizeMenuBtn[inactive="false"]:hover {{
+            background: {CORAL_HOVER};
+        }}
+        QPushButton#pillOptimizeMenuBtn[inactive="false"]:pressed {{
+            background: {CORAL_PRESSED};
         }}
         QPushButton#pillOptimizeBtn[inactive="false"] {{
             background: {CORAL};
             color: {CORAL_ON};
             border: none;
-            border-radius: 6px;
+            border-top-right-radius: 0px;
+            border-bottom-right-radius: 0px;
+            border-top-left-radius: 6px;
+            border-bottom-left-radius: 6px;
             padding: 5px 12px;
             font-size: {F["size_sm"]}px;
             font-weight: 500;
@@ -257,9 +298,22 @@ def popup_stylesheet() -> str:
         QWidget#injectRow {{
             background: transparent;
         }}
-        QLabel#injectLabel {{
+        QFrame#injectTargetSelector {{
+            background: transparent;
+        }}
+        QFrame#injectTargetSelectorButton {{
+            background: {INPUT_BG};
+            border: 1px solid {BORDER_CONTROL};
+            border-radius: {R["button"]}px;
+            min-height: 28px;
+        }}
+        QFrame#injectTargetSelectorButton:hover {{
+            border-color: {BORDER_STRONG};
+        }}
+        QFrame#injectTargetSelectorButton QLabel {{
             color: {C["text_muted"]};
-            font-size: {F["size_sm"]}px;
+            background: transparent;
+            border: none;
         }}
         QPushButton#injectBtn {{
             background: transparent;
@@ -269,11 +323,51 @@ def popup_stylesheet() -> str:
             padding: 5px 12px;
             font-size: {F["size_sm"]}px;
             font-weight: 500;
+            min-height: 28px;
         }}
-        QPushButton#injectBtn:hover {{
+        QPushButton#injectBtn:hover:enabled {{
             color: {C["text"]};
             border-color: {C["border_hover"]};
             background: rgba(255, 255, 255, 0.06);
+        }}
+        QPushButton#injectBtn:disabled {{
+            color: {C["text_muted"]};
+            border-color: {C["border_subtle"]};
+            opacity: 0.5;
+        }}
+        QFrame#targetWindowChip {{
+            background: transparent;
+        }}
+        QFrame#targetWindowChipButton {{
+            background: {INPUT_BG};
+            border: 1px solid {BORDER_CONTROL};
+            border-radius: 5px;
+            min-height: 22px;
+        }}
+        QFrame#targetWindowChipButton:hover {{
+            border-color: {BORDER_STRONG};
+        }}
+        QFrame#targetWindowChipButton QLabel {{
+            color: {TEXT_SECONDARY};
+            background: transparent;
+            border: none;
+        }}
+        QMenu#targetWindowMenu {{
+            background: {SURFACE_RAISED};
+            border: 1px solid {BORDER_CONTROL};
+            border-radius: 8px;
+            padding: 4px;
+        }}
+        QMenu#targetWindowMenu::item {{
+            padding: 6px 12px;
+            border-radius: 4px;
+        }}
+        QMenu#targetWindowMenu::item:selected {{
+            background: {CORAL_TINT};
+            color: {TEXT_PRIMARY};
+        }}
+        QWidget#windowPickerOverlay {{
+            background: transparent;
         }}
         QTextEdit#resultText {{
             background: {C["result_bg"]};
@@ -975,6 +1069,63 @@ def settings_stylesheet() -> str:
         }}
         QDialog#patternsDialog QLabel {{
             color: {TEXT_BODY};
+        }}
+    """
+
+
+def rate_limit_dialog_stylesheet() -> str:
+    """QSS for the custom rate-limit prompt (popup-adjacent alert)."""
+    return f"""
+        QFrame#rateLimitDialogShell {{
+            background: {SURFACE_RAISED};
+            border: 1px solid {BORDER_STRONG};
+            border-radius: 14px;
+        }}
+        QLabel#rateLimitDialogTitle {{
+            color: {TEXT_PRIMARY};
+        }}
+        QLabel#rateLimitDialogBody {{
+            color: {TEXT_BODY};
+        }}
+        QLabel#rateLimitDialogWarning {{
+            color: #E8B84A;
+        }}
+        QPushButton#rateLimitCloseBtn {{
+            background: transparent;
+            border: none;
+            color: {TEXT_MUTED};
+            padding: 2px 6px;
+            font-size: 14px;
+        }}
+        QPushButton#rateLimitCloseBtn:hover {{
+            color: {TEXT_PRIMARY};
+        }}
+        QPushButton#rateLimitPrimaryBtn {{
+            background: {CORAL};
+            color: {CORAL_ON};
+            border: none;
+            border-radius: 8px;
+            padding: 8px 16px;
+            font-size: {FONT_SMALL}px;
+            font-weight: 500;
+        }}
+        QPushButton#rateLimitPrimaryBtn:hover {{
+            background: {CORAL_HOVER};
+        }}
+        QPushButton#rateLimitPrimaryBtn:pressed {{
+            background: {CORAL_PRESSED};
+        }}
+        QPushButton#rateLimitSecondaryBtn {{
+            background: {INPUT_BG};
+            color: {TEXT_BODY};
+            border: 1px solid {BORDER_CONTROL};
+            border-radius: 8px;
+            padding: 8px 16px;
+            font-size: {FONT_SMALL}px;
+        }}
+        QPushButton#rateLimitSecondaryBtn:hover {{
+            border-color: {BORDER_STRONG};
+            color: {TEXT_PRIMARY};
         }}
     """
 

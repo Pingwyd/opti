@@ -39,7 +39,9 @@ def qapp():
 @pytest.fixture
 def isolated_config(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
+    vault_path = tmp_path / "vault.json"
     monkeypatch.setattr(config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr("vault.VAULT_PATH", vault_path)
     return config_path
 
 
@@ -333,6 +335,9 @@ def test_compute_shortcut_conflicts_detects_duplicates():
         "Ctrl+Alt+]",
         "Esc",
         "Ctrl+Shift+P",
+        "Ctrl+T",
+        "Ctrl+Shift+T",
+        "Ctrl+Space",
     )
     assert conflicts["hotkey"] is True
     assert conflicts["hotkey_collapse"] is True

@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from typing import Callable
 
 from PyQt6.QtCore import (
     QEasingCurve,
+    QPoint,
     QPointF,
     QPropertyAnimation,
     QRectF,
     QSize,
     Qt,
+    QTimer,
     pyqtProperty,
     pyqtSignal,
 )
@@ -31,6 +34,7 @@ from PyQt6.QtGui import (
     QKeySequence,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
 )
@@ -157,8 +161,9 @@ class GrowingTextEdit(QTextEdit):
         font = settings_font(DESIGN_TOKENS["font"]["size_base"])
         self.setFont(font)
         doc = self.document()
-        doc.setDocumentMargin(0)
+        doc.setDocumentMargin(2)
         doc.contentsChanged.connect(self._on_contents_changed)
+        QTimer.singleShot(0, self._emit_height)
 
     def show_ghost_example(self, text: str) -> None:
         self._ghost_text = text
@@ -167,7 +172,9 @@ class GrowingTextEdit(QTextEdit):
         ghost_font = settings_font(DESIGN_TOKENS["font"]["size_base"])
         ghost_font.setItalic(True)
         self.setFont(ghost_font)
-        self.setStyleSheet(f"color: {TEXT_DISABLED};")
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Text, QColor(TEXT_DISABLED))
+        self.setPalette(palette)
         self._emit_height()
 
     def _dismiss_ghost(self) -> None:
@@ -177,7 +184,9 @@ class GrowingTextEdit(QTextEdit):
         self._ghost_text = ""
         self.clear()
         self.setFont(settings_font(DESIGN_TOKENS["font"]["size_base"]))
-        self.setStyleSheet("")
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Text, QColor(TEXT_PRIMARY))
+        self.setPalette(palette)
         self.ghostDismissed.emit()
 
     def effective_text(self) -> str:
@@ -218,10 +227,17 @@ class GrowingTextEdit(QTextEdit):
 
     def _line_height(self) -> int:
         fm = QFontMetrics(self.font())
-        return fm.lineSpacing()
+        # height() includes descenders (y, p, g); lineSpacing() alone clips placeholders.
+        return max(fm.lineSpacing(), fm.height())
+
+    def _vertical_padding(self) -> int:
+        """Extra viewport space so QTextEdit placeholder/ghost text isn't clipped."""
+        return 6
 
     def _margins(self) -> int:
-        return self.frameWidth() * 2 + int(self.document().documentMargin() * 2) + 2
+        doc_margin = int(self.document().documentMargin() * 2)
+        frame = self.frameWidth() * 2
+        return frame + doc_margin + self._vertical_padding()
 
     def _emit_height(self) -> None:
         doc = self.document()
@@ -403,8 +419,87 @@ class PrivateToggleChip(QAbstractButton):
             painter.drawLine(QPointF(cx - 5, cy + 4), QPointF(cx + 5, cy - 4))
 
 
+class TransformActionButton(QWidget):
+    """
+    Split primary action: main area runs the transform; chevron opens mode menu.
+    """
+
+    runClicked = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("transformActionButton")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._main_btn = QPushButton(self)
+        self._main_btn.setObjectName("pillOptimizeBtn")
+        self._main_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._main_btn.setAccessibleName("Run transform")
+        self._main_btn.clicked.connect(self.runClicked.emit)
+
+        self._menu_btn = QPushButton("\u25be", self)
+        self._menu_btn.setObjectName("pillOptimizeMenuBtn")
+        self._menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._menu_btn.setAccessibleName("Choose transform mode")
+        self._menu_btn.setFixedWidth(26)
+
+        layout.addWidget(self._main_btn)
+        layout.addWidget(self._menu_btn)
+
+        self._has_text = False
+        self._action_label = "Optimize"
+        self._refresh_label()
+        self._apply_inactive_state()
+
+    def set_menu_clicked(self, handler: Callable[[], None]) -> None:
+        self._menu_btn.clicked.connect(handler)
+
+    def menu_anchor_global(self) -> QPoint:
+        """Bottom-left corner of the chevron, for positioning a dropdown menu."""
+        return self._menu_btn.mapToGlobal(QPoint(0, self._menu_btn.height()))
+
+    def set_action_label(self, label: str) -> None:
+        text = (label or "Optimize").strip() or "Optimize"
+        if text == self._action_label:
+            return
+        self._action_label = text
+        self._refresh_label()
+
+    def set_has_text(self, has_text: bool) -> None:
+        self._has_text = has_text
+        self._apply_inactive_state()
+        self._refresh_label()
+
+    def set_tooltips(self, main_tip: str, menu_tip: str) -> None:
+        self._main_btn.setToolTip(main_tip)
+        self._menu_btn.setToolTip(menu_tip)
+
+    def _apply_inactive_state(self) -> None:
+        inactive = "false" if self._has_text else "true"
+        for btn in (self._main_btn, self._menu_btn):
+            btn.setProperty("inactive", inactive)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def _refresh_label(self) -> None:
+        hint = "Ctrl+↵"
+        try:
+            import sys
+
+            if sys.platform == "darwin":
+                hint = "⌘↵"
+        except Exception:
+            pass
+        if self._has_text:
+            self._main_btn.setText(f"{self._action_label}  {hint}")
+        else:
+            self._main_btn.setText(self._action_label)
+
+
 class PrimaryButton(QPushButton):
-    """Optimize button with optional shortcut hint."""
+    """Legacy single-button primary action (prefer TransformActionButton)."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -412,6 +507,14 @@ class PrimaryButton(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setProperty("inactive", "true")
         self._has_text = False
+        self._action_label = "Optimize"
+        self._refresh_label()
+
+    def set_action_label(self, label: str) -> None:
+        text = (label or "Optimize").strip() or "Optimize"
+        if text == self._action_label:
+            return
+        self._action_label = text
         self._refresh_label()
 
     def set_has_text(self, has_text: bool) -> None:
@@ -431,9 +534,9 @@ class PrimaryButton(QPushButton):
         except Exception:
             pass
         if self._has_text:
-            self.setText(f"Optimize  {hint}")
+            self.setText(f"{self._action_label}  {hint}")
         else:
-            self.setText("Optimize")
+            self.setText(self._action_label)
 
 
 class PillIconButton(QAbstractButton):
@@ -478,6 +581,10 @@ class PillIconButton(QAbstractButton):
                 x2 = cx + 7.5 * math.cos(rad)
                 y2 = cy + 7.5 * math.sin(rad)
                 painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        elif self._kind == "crosshair":
+            painter.drawLine(QPointF(cx - 6, cy), QPointF(cx + 6, cy))
+            painter.drawLine(QPointF(cx, cy - 6), QPointF(cx, cy + 6))
+            painter.drawEllipse(QRectF(cx - 3, cy - 3, 6, 6))
         painter.end()
 
 

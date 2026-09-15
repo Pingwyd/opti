@@ -43,13 +43,17 @@ from config import (
     DEFAULT_SHORTCUT_COLLAPSE,
     DEFAULT_SHORTCUT_HIDE_TRAY,
     DEFAULT_SHORTCUT_PRIVATE,
+    DEFAULT_SHORTCUT_TRANSFORM_CYCLE,
+    DEFAULT_SHORTCUT_TRANSFORM_CYCLE_REVERSE,
     DEFAULT_VOICE_PTT_SHORTCUT,
     PROVIDER_PRESETS,
     VALID_PROVIDERS,
+    VALID_VOICE_MODEL_SIZES,
     get_provider,
     get_settings_window_geometry,
     global_hotkeys_conflict,
     has_api_key,
+    has_stored_key_for_provider,
     hotkey_conflicts_with_shortcuts,
     in_app_shortcuts_conflict,
     is_recognized_model_id,
@@ -65,6 +69,10 @@ from config import (
 from history import DEFAULT_SENSITIVE_KEYWORDS, counts_by_project_name
 from hotkey_service import parse_hotkey_to_pynput
 from projects import create_project, delete_project, get_project, list_projects, update_project
+from prompt import VALID_TRANSFORMS, normalize_transform
+from transform_ui import TRANSFORM_MENU_LABELS
+from vault import env_key_hint
+from voice import missing_voice_deps_message, voice_deps_available
 from startup import (
     disable_start_with_windows,
     enable_start_with_windows,
@@ -210,12 +218,26 @@ def apply_settings_values(values: dict[str, Any], *, require_api_key: bool = Fal
     shortcut_private = normalize_shortcut_string(
         str(values.get("shortcut_private") or ""), DEFAULT_SHORTCUT_PRIVATE
     )
+    shortcut_transform_cycle = normalize_shortcut_string(
+        str(values.get("shortcut_transform_cycle") or ""),
+        DEFAULT_SHORTCUT_TRANSFORM_CYCLE,
+    )
+    shortcut_transform_cycle_reverse = normalize_shortcut_string(
+        str(values.get("shortcut_transform_cycle_reverse") or ""),
+        DEFAULT_SHORTCUT_TRANSFORM_CYCLE_REVERSE,
+    )
     hotkey = normalize_hotkey_string(str(values.get("hotkey") or ""), DEFAULT_HOTKEY)
     hotkey_collapse = normalize_hotkey_string(
         str(values.get("hotkey_collapse") or ""), DEFAULT_HOTKEY_COLLAPSE
     )
 
-    if in_app_shortcuts_conflict(shortcut_collapse, shortcut_hide_tray, shortcut_private):
+    if in_app_shortcuts_conflict(
+        shortcut_collapse,
+        shortcut_hide_tray,
+        shortcut_private,
+        shortcut_transform_cycle,
+        shortcut_transform_cycle_reverse,
+    ):
         return "In-app shortcuts must each be unique."
     if global_hotkeys_conflict(hotkey, hotkey_collapse):
         return "Global hotkeys must each be unique."
@@ -225,6 +247,10 @@ def apply_settings_values(values: dict[str, Any], *, require_api_key: bool = Fal
         shortcut_hide_tray,
         shortcut_private,
         hotkey_collapse=hotkey_collapse,
+        extra_in_app_shortcuts=(
+            shortcut_transform_cycle,
+            shortcut_transform_cycle_reverse,
+        ),
     ):
         return "Global hotkeys cannot match an in-app shortcut."
 
@@ -246,6 +272,8 @@ def apply_settings_values(values: dict[str, Any], *, require_api_key: bool = Fal
     cfg["shortcut_collapse"] = shortcut_collapse
     cfg["shortcut_hide_tray"] = shortcut_hide_tray
     cfg["shortcut_private"] = shortcut_private
+    cfg["shortcut_transform_cycle"] = shortcut_transform_cycle
+    cfg["shortcut_transform_cycle_reverse"] = shortcut_transform_cycle_reverse
     cfg["auto_copy_clipboard"] = bool(values.get("auto_copy_clipboard", True))
     cfg["auto_inject_enabled"] = bool(values.get("auto_inject_enabled", False))
     cfg["include_project_context_in_private"] = bool(
@@ -262,7 +290,7 @@ def apply_settings_values(values: dict[str, Any], *, require_api_key: bool = Fal
     save_config(cfg)
 
     if api_key_input:
-        set_api_key(api_key_input)
+        set_api_key(api_key_input, provider=provider)
 
     want_startup = bool(values.get("start_with_windows", False))
     have_startup = is_start_with_windows_enabled()
@@ -280,9 +308,12 @@ def compute_shortcut_conflicts(
     shortcut_collapse: str,
     shortcut_hide: str,
     shortcut_private: str,
+    shortcut_transform_cycle: str,
+    shortcut_transform_cycle_reverse: str,
+    voice_ptt_shortcut: str = DEFAULT_VOICE_PTT_SHORTCUT,
 ) -> dict[str, bool]:
     """
-    Pure pairwise duplicate-detection across the five configurable bindings.
+    Pure pairwise duplicate-detection across configurable bindings.
 
     Used by the Shortcuts pane to flag conflicts live as the user records new
     combos; kept standalone so it's testable without instantiating any Qt
@@ -294,6 +325,9 @@ def compute_shortcut_conflicts(
         "shortcut_collapse": shortcut_collapse,
         "shortcut_hide_tray": shortcut_hide,
         "shortcut_private": shortcut_private,
+        "shortcut_transform_cycle": shortcut_transform_cycle,
+        "shortcut_transform_cycle_reverse": shortcut_transform_cycle_reverse,
+        "voice_ptt_shortcut": voice_ptt_shortcut,
     }
     conflicts = dict.fromkeys(pairs, False)
     items = list(pairs.items())
@@ -453,15 +487,16 @@ class _ApiKeyControl(QWidget):
     """
     API key row control: a status indicator, not a persistent input.
 
-    Set   -> "\u2713 Set    Replace"
-    Unset -> "Not set    Add key"
-    Editing -> masked input + confirm/cancel
+    Key saved -> "\u2713 Key saved    Update key    Clear key"
+    Not set   -> "Not set    Add key"
+    Editing   -> masked input + confirm/cancel
     """
 
     key_committed = pyqtSignal(str)  # new plaintext key, or "" to clear
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._has_key = False
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -483,6 +518,14 @@ class _ApiKeyControl(QWidget):
         self._action_btn.setFlat(True)
         self._action_btn.clicked.connect(self.start_editing)
         layout.addWidget(self._action_btn)
+
+        self._clear_btn = QPushButton("Clear key", self)
+        self._clear_btn.setObjectName("linkAction")
+        self._clear_btn.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        self._clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clear_btn.setFlat(True)
+        self._clear_btn.clicked.connect(self._clear_key)
+        layout.addWidget(self._clear_btn)
 
         self._edit_input = QLineEdit(self)
         self._edit_input.setEchoMode(QLineEdit.EchoMode.Password)
@@ -512,14 +555,16 @@ class _ApiKeyControl(QWidget):
         self.setFocusProxy(self._action_btn)
 
     def refresh(self, *, has_key: bool) -> None:
+        self._has_key = has_key
         self._edit_input.hide()
         self._edit_input.clear()
         self._confirm_btn.hide()
         self._cancel_btn.hide()
         self._check.setVisible(has_key)
-        self._status_label.setText("Set" if has_key else "Not set")
+        self._status_label.setText("Key saved" if has_key else "Not set")
         self._status_label.setStyleSheet("" if has_key else f"color: {TEXT_MUTED};")
-        self._action_btn.setText("Replace" if has_key else "Add key")
+        self._action_btn.setText("Update key" if has_key else "Add key")
+        self._clear_btn.setVisible(has_key)
         self._status_label.show()
         self._action_btn.show()
 
@@ -527,6 +572,7 @@ class _ApiKeyControl(QWidget):
         self._status_label.hide()
         self._check.hide()
         self._action_btn.hide()
+        self._clear_btn.hide()
         self._edit_input.show()
         self._edit_input.setFocus()
         self._confirm_btn.show()
@@ -536,8 +582,11 @@ class _ApiKeyControl(QWidget):
         value = self._edit_input.text().strip()
         self.key_committed.emit(value)
 
+    def _clear_key(self) -> None:
+        self.key_committed.emit("")
+
     def _cancel_edit(self) -> None:
-        self.refresh(has_key=has_api_key())
+        self.refresh(has_key=self._has_key)
 
 
 class _PatternsDialog(QDialog):
@@ -986,6 +1035,21 @@ class SettingsDialog(QDialog):
         self._persist_draft_row.set_control(self._persist_draft_toggle)
         group.addWidget(self._persist_draft_row)
 
+        self._default_transform_row = SettingRow(
+            "Default transform", "Used when no project is active"
+        )
+        self._default_transform_combo = QComboBox()
+        self._default_transform_combo.setFont(settings_font(FONT_BODY))
+        for transform_id in VALID_TRANSFORMS:
+            self._default_transform_combo.addItem(
+                TRANSFORM_MENU_LABELS[transform_id], transform_id
+            )
+        self._default_transform_combo.currentIndexChanged.connect(
+            self._on_default_transform_changed
+        )
+        self._default_transform_row.set_control(self._default_transform_combo)
+        group.addWidget(self._default_transform_row)
+
         self._finalize_rows(group)
         outer.addStretch(1)
         return scroll
@@ -997,6 +1061,10 @@ class SettingsDialog(QDialog):
             row.set_helper_text("Unrecognized model ID. Optimization may fail.", danger=True)
         else:
             row.set_helper_text("")
+
+    def _on_default_transform_changed(self, _index: int) -> None:
+        transform = str(self._default_transform_combo.currentData() or "optimize")
+        self._write({"transform": transform})
 
     def _on_provider_changed(self, _index: int) -> None:
         provider = str(self._provider_combo.currentData() or "gemini")
@@ -1015,6 +1083,12 @@ class SettingsDialog(QDialog):
         self._write(
             {"provider": provider, "model": preset["model"], "model_fast": preset["model_fast"]}
         )
+        self._refresh_api_key_status(provider)
+
+    def _refresh_api_key_status(self, provider: str | None = None) -> None:
+        provider = str(provider or self._provider_combo.currentData() or "gemini")
+        self._api_key_control.refresh(has_key=has_stored_key_for_provider(provider))
+        self._api_key_row.set_helper_text(env_key_hint(provider))
 
     def _reset_model_field(self, field: str) -> None:
         provider = str(self._provider_combo.currentData() or "gemini")
@@ -1029,8 +1103,12 @@ class SettingsDialog(QDialog):
         self._write({field: value})
 
     def _on_api_key_committed(self, value: str) -> None:
-        self._writer.run_task(lambda: set_api_key(value))
-        self._api_key_control.refresh(has_key=bool(value))
+        provider = str(self._provider_combo.currentData() or "gemini")
+        try:
+            set_api_key(value, provider=provider)
+        except Exception:
+            log.exception("Opti settings: failed to save API key")
+        self._refresh_api_key_status(provider)
 
     # -- Privacy pane -----------------------------------------------------
 
@@ -1051,6 +1129,55 @@ class SettingsDialog(QDialog):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._write({"exclude_sensitive_keywords": dlg.patterns()})
             self._exclude_sensitive_row.set_helper_text(self._patterns_helper_html())
+
+    def _voice_subcontrol_rows(self) -> tuple[SettingRow, ...]:
+        return (
+            self._voice_recording_mode_row,
+            self._voice_model_size_row,
+            self._voice_toggle_max_row,
+        )
+
+    def _on_voice_enabled_toggled(self, checked: bool) -> None:
+        self._write({"voice_enabled": checked})
+        self._update_voice_subcontrols(checked)
+        self._refresh_voice_deps_helper()
+
+    def _on_voice_recording_mode_changed(self, _index: int) -> None:
+        mode = str(self._voice_recording_mode_combo.currentData() or "push_to_talk")
+        self._write({"voice_recording_mode": mode})
+        self._update_voice_toggle_max_visibility(mode)
+
+    def _on_voice_model_size_changed(self, _index: int) -> None:
+        size = str(self._voice_model_size_combo.currentData() or "base")
+        self._write({"voice_model_size": size})
+
+    def _update_voice_toggle_max_visibility(self, mode: str | None = None) -> None:
+        mode = mode or str(self._voice_recording_mode_combo.currentData() or "push_to_talk")
+        show_max = mode == "toggle"
+        self._voice_toggle_max_row.setVisible(show_max)
+
+    def _update_voice_subcontrols(self, enabled: bool | None = None) -> None:
+        if enabled is None:
+            enabled = self._voice_enabled_toggle.isChecked()
+        for row in self._voice_subcontrol_rows():
+            row.setEnabled(enabled)
+        if enabled:
+            self._update_voice_toggle_max_visibility()
+
+    def _refresh_voice_deps_helper(self) -> None:
+        if not self._voice_enabled_toggle.isChecked():
+            self._voice_enabled_row.set_helper_text(
+                "Local speech-to-text via faster-whisper. Mic button appears on the prompt bar."
+            )
+            return
+        if voice_deps_available():
+            self._voice_enabled_row.set_helper_text(
+                "Ready. Hold the mic or use the voice shortcut while the popup is focused."
+            )
+        else:
+            self._voice_enabled_row.set_helper_text(
+                missing_voice_deps_message(), danger=True
+            )
 
     def _build_privacy_pane(self) -> QScrollArea:
         scroll, outer = self._build_pane("Privacy", "What gets stored and copied")
@@ -1103,14 +1230,56 @@ class SettingsDialog(QDialog):
 
         self._voice_enabled_row = SettingRow(
             "Voice input",
-            "Shows the mic button on the prompt bar. Push-to-talk while the popup is focused.",
+            "Local speech-to-text via faster-whisper. Mic button appears on the prompt bar.",
         )
         self._voice_enabled_toggle = ToggleSwitch()
-        self._voice_enabled_toggle.toggled.connect(
-            lambda v: self._write({"voice_enabled": v})
-        )
+        self._voice_enabled_toggle.toggled.connect(self._on_voice_enabled_toggled)
         self._voice_enabled_row.set_control(self._voice_enabled_toggle)
         group.addWidget(self._voice_enabled_row)
+
+        self._voice_recording_mode_row = SettingRow(
+            "Recording mode",
+            "Push-to-talk: hold mic or shortcut. Toggle: tap to start/stop.",
+        )
+        self._voice_recording_mode_combo = QComboBox()
+        self._voice_recording_mode_combo.setFont(settings_font(FONT_BODY))
+        self._voice_recording_mode_combo.addItem("Push-to-talk", "push_to_talk")
+        self._voice_recording_mode_combo.addItem("Toggle", "toggle")
+        self._voice_recording_mode_combo.currentIndexChanged.connect(
+            self._on_voice_recording_mode_changed
+        )
+        self._voice_recording_mode_row.set_control(self._voice_recording_mode_combo)
+        group.addWidget(self._voice_recording_mode_row)
+
+        self._voice_model_size_row = SettingRow(
+            "Whisper model",
+            "Larger models are more accurate but slower and use more disk space.",
+        )
+        self._voice_model_size_combo = QComboBox()
+        self._voice_model_size_combo.setFont(settings_font(FONT_BODY))
+        for size in VALID_VOICE_MODEL_SIZES:
+            label = size.capitalize()
+            if size == "tiny":
+                label = "Tiny (fastest)"
+            elif size == "medium":
+                label = "Medium (most accurate)"
+            self._voice_model_size_combo.addItem(label, size)
+        self._voice_model_size_combo.currentIndexChanged.connect(
+            self._on_voice_model_size_changed
+        )
+        self._voice_model_size_row.set_control(self._voice_model_size_combo)
+        group.addWidget(self._voice_model_size_row)
+
+        self._voice_toggle_max_row = SettingRow(
+            "Toggle max duration",
+            "Auto-stop toggle recording after this many seconds.",
+        )
+        self._voice_toggle_max_stepper = Stepper(5, 600, 5, 60)
+        self._voice_toggle_max_stepper.valueChanged.connect(
+            lambda v: self._write({"voice_toggle_max_seconds": v})
+        )
+        self._voice_toggle_max_row.set_control(self._voice_toggle_max_stepper)
+        group.addWidget(self._voice_toggle_max_row)
 
         self._finalize_rows(group)
         outer.addStretch(1)
@@ -1196,6 +1365,47 @@ class SettingsDialog(QDialog):
         )
         self._shortcut_private_row.set_control(shortcut_private_cap)
         focused_group.addWidget(self._shortcut_private_row)
+
+        self._shortcut_transform_cycle_row = SettingRow(
+            "Cycle transform mode", control_width=SettingRow.SHORTCUT_CONTROL_WIDTH
+        )
+        shortcut_transform_cycle_cap = KeyCapRow(
+            str(cfg.get("shortcut_transform_cycle") or DEFAULT_SHORTCUT_TRANSFORM_CYCLE)
+        )
+        shortcut_transform_cycle_cap.sequence_changed.connect(
+            lambda seq: self._on_shortcut_changed("shortcut_transform_cycle", seq)
+        )
+        self._shortcut_transform_cycle_row.set_control(shortcut_transform_cycle_cap)
+        focused_group.addWidget(self._shortcut_transform_cycle_row)
+
+        self._shortcut_transform_cycle_reverse_row = SettingRow(
+            "Cycle transform mode (reverse)",
+            control_width=SettingRow.SHORTCUT_CONTROL_WIDTH,
+        )
+        shortcut_transform_cycle_reverse_cap = KeyCapRow(
+            str(cfg.get("shortcut_transform_cycle_reverse") or DEFAULT_SHORTCUT_TRANSFORM_CYCLE_REVERSE)
+        )
+        shortcut_transform_cycle_reverse_cap.sequence_changed.connect(
+            lambda seq: self._on_shortcut_changed("shortcut_transform_cycle_reverse", seq)
+        )
+        self._shortcut_transform_cycle_reverse_row.set_control(
+            shortcut_transform_cycle_reverse_cap
+        )
+        focused_group.addWidget(self._shortcut_transform_cycle_reverse_row)
+
+        self._voice_ptt_row = SettingRow(
+            "Voice push-to-talk",
+            control_width=SettingRow.SHORTCUT_CONTROL_WIDTH,
+        )
+        voice_ptt_cap = KeyCapRow(
+            str(cfg.get("voice_ptt_shortcut") or DEFAULT_VOICE_PTT_SHORTCUT)
+        )
+        voice_ptt_cap.sequence_changed.connect(
+            lambda seq: self._on_shortcut_changed("voice_ptt_shortcut", seq)
+        )
+        self._voice_ptt_row.set_control(voice_ptt_cap)
+        focused_group.addWidget(self._voice_ptt_row)
+
         self._finalize_rows(focused_group)
 
         self._shortcut_caps = {
@@ -1204,6 +1414,9 @@ class SettingsDialog(QDialog):
             "shortcut_collapse": shortcut_collapse_cap,
             "shortcut_hide_tray": shortcut_hide_cap,
             "shortcut_private": shortcut_private_cap,
+            "shortcut_transform_cycle": shortcut_transform_cycle_cap,
+            "shortcut_transform_cycle_reverse": shortcut_transform_cycle_reverse_cap,
+            "voice_ptt_shortcut": voice_ptt_cap,
         }
         self._shortcut_rows = {
             "hotkey": self._hotkey_row,
@@ -1211,6 +1424,9 @@ class SettingsDialog(QDialog):
             "shortcut_collapse": self._shortcut_collapse_row,
             "shortcut_hide_tray": self._shortcut_hide_row,
             "shortcut_private": self._shortcut_private_row,
+            "shortcut_transform_cycle": self._shortcut_transform_cycle_row,
+            "shortcut_transform_cycle_reverse": self._shortcut_transform_cycle_reverse_row,
+            "voice_ptt_shortcut": self._voice_ptt_row,
         }
         self._last_good_shortcuts = {k: cap.sequence() for k, cap in self._shortcut_caps.items()}
 
@@ -1250,6 +1466,9 @@ class SettingsDialog(QDialog):
             seqs["shortcut_collapse"],
             seqs["shortcut_hide_tray"],
             seqs["shortcut_private"],
+            seqs["shortcut_transform_cycle"],
+            seqs["shortcut_transform_cycle_reverse"],
+            seqs.get("voice_ptt_shortcut", DEFAULT_VOICE_PTT_SHORTCUT),
         )
         for key, cap in self._shortcut_caps.items():
             is_conflict = conflicts[key]
@@ -1265,6 +1484,9 @@ class SettingsDialog(QDialog):
             "shortcut_collapse": DEFAULT_SHORTCUT_COLLAPSE,
             "shortcut_hide_tray": DEFAULT_SHORTCUT_HIDE_TRAY,
             "shortcut_private": DEFAULT_SHORTCUT_PRIVATE,
+            "shortcut_transform_cycle": DEFAULT_SHORTCUT_TRANSFORM_CYCLE,
+            "shortcut_transform_cycle_reverse": DEFAULT_SHORTCUT_TRANSFORM_CYCLE_REVERSE,
+            "voice_ptt_shortcut": DEFAULT_VOICE_PTT_SHORTCUT,
         }
         for key, seq in defaults.items():
             self._shortcut_caps[key].set_sequence(seq)
@@ -1452,6 +1674,52 @@ class SettingsDialog(QDialog):
         )
         detail_layout.addWidget(self._project_notes_edit)
 
+        inject_label = QLabel("Inject target process")
+        inject_label.setObjectName("fieldCaption")
+        inject_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        detail_layout.addWidget(inject_label)
+
+        transform_label = QLabel("Default transform")
+        transform_label.setObjectName("fieldCaption")
+        transform_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        detail_layout.addWidget(transform_label)
+
+        self._project_default_transform = QComboBox()
+        self._project_default_transform.setObjectName("projectDefaultTransform")
+        self._project_default_transform.setFont(settings_font(FONT_BODY))
+        for transform_id in VALID_TRANSFORMS:
+            self._project_default_transform.addItem(
+                TRANSFORM_MENU_LABELS[transform_id], transform_id
+            )
+        self._project_default_transform.currentIndexChanged.connect(
+            self._on_project_default_transform_changed
+        )
+        detail_layout.addWidget(self._project_default_transform)
+
+        transform_help = QLabel(
+            "When this project is active, the pill uses this transform by default."
+        )
+        transform_help.setObjectName("settingRowHelper")
+        transform_help.setFont(settings_font(FONT_CAPTION))
+        transform_help.setWordWrap(True)
+        detail_layout.addWidget(transform_help)
+
+        self._project_inject_process = QLineEdit()
+        self._project_inject_process.setObjectName("projectInjectProcess")
+        self._project_inject_process.setFont(settings_font(FONT_BODY))
+        self._project_inject_process.setPlaceholderText("e.g. Code.exe — leave empty for pill selector")
+        self._project_inject_process.textChanged.connect(self._on_project_inject_process_changed)
+        detail_layout.addWidget(self._project_inject_process)
+
+        inject_help = QLabel(
+            "When set, optimizations for this project always inject into that app "
+            "(first open window if several match)."
+        )
+        inject_help.setObjectName("settingRowHelper")
+        inject_help.setFont(settings_font(FONT_CAPTION))
+        inject_help.setWordWrap(True)
+        detail_layout.addWidget(inject_help)
+
         body.addWidget(detail_wrap, 1)
         outer.addLayout(body, 1)
 
@@ -1508,9 +1776,13 @@ class SettingsDialog(QDialog):
                 self._project_saved_label.setText("")
                 self._project_context_edit.setPlainText("")
                 self._project_notes_edit.setPlainText("")
+                self._project_inject_process.clear()
+                self._project_default_transform.setCurrentIndex(0)
                 self._project_delete_btn.setEnabled(False)
                 self._project_context_edit.setEnabled(False)
                 self._project_notes_edit.setEnabled(False)
+                self._project_inject_process.setEnabled(False)
+                self._project_default_transform.setEnabled(False)
                 return
 
             project = get_project(project_id)
@@ -1519,6 +1791,8 @@ class SettingsDialog(QDialog):
 
             self._project_context_edit.setEnabled(True)
             self._project_notes_edit.setEnabled(True)
+            self._project_inject_process.setEnabled(True)
+            self._project_default_transform.setEnabled(True)
             self._project_delete_btn.setEnabled(True)
             self._project_name_label.setText(str(project.get("name") or "Project"))
             self._project_saved_label.setText(
@@ -1526,6 +1800,16 @@ class SettingsDialog(QDialog):
             )
             self._project_context_edit.setPlainText(str(project.get("conventions") or ""))
             self._project_notes_edit.setPlainText(str(project.get("notes") or ""))
+            self._project_inject_process.blockSignals(True)
+            self._project_inject_process.setText(str(project.get("inject_process") or ""))
+            self._project_inject_process.blockSignals(False)
+            transform = normalize_transform(project.get("default_transform"))
+            transform_index = self._project_default_transform.findData(transform)
+            self._project_default_transform.blockSignals(True)
+            self._project_default_transform.setCurrentIndex(
+                transform_index if transform_index >= 0 else 0
+            )
+            self._project_default_transform.blockSignals(False)
         finally:
             self._loading_project_detail = False
 
@@ -1533,6 +1817,19 @@ class SettingsDialog(QDialog):
         if self._loading_project_detail or not self._selected_project_id:
             return
         self._pending_project_fields[field] = edit.toPlainText()
+        self._project_save_timer.start(400)
+
+    def _on_project_inject_process_changed(self, text: str) -> None:
+        if self._loading_project_detail or not self._selected_project_id:
+            return
+        self._pending_project_fields["inject_process"] = text.strip()
+        self._project_save_timer.start(400)
+
+    def _on_project_default_transform_changed(self, _index: int) -> None:
+        if self._loading_project_detail or not self._selected_project_id:
+            return
+        transform = str(self._project_default_transform.currentData() or "optimize")
+        self._pending_project_fields["default_transform"] = transform
         self._project_save_timer.start(400)
 
     def _flush_project_save(self) -> None:
@@ -1554,6 +1851,8 @@ class SettingsDialog(QDialog):
             "project_type": project.get("project_type", ""),
             "conventions": project.get("conventions", ""),
             "notes": project.get("notes", ""),
+            "inject_process": project.get("inject_process", ""),
+            "default_transform": project.get("default_transform", "optimize"),
         }
         kwargs.update(fields)
         try:
@@ -1654,7 +1953,7 @@ class SettingsDialog(QDialog):
         self._provider_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._provider_combo.blockSignals(False)
 
-        self._api_key_control.refresh(has_key=has_api_key())
+        self._refresh_api_key_status(provider)
 
         self._model_input.blockSignals(True)
         self._model_input.setText(str(cfg.get("model") or PROVIDER_PRESETS[provider]["model"]))
@@ -1670,6 +1969,14 @@ class SettingsDialog(QDialog):
 
         self._persist_draft_toggle.set_checked_silent(bool(cfg.get("persist_draft", True)))
 
+        transform = normalize_transform(cfg.get("transform"))
+        transform_index = self._default_transform_combo.findData(transform)
+        self._default_transform_combo.blockSignals(True)
+        self._default_transform_combo.setCurrentIndex(
+            transform_index if transform_index >= 0 else 0
+        )
+        self._default_transform_combo.blockSignals(False)
+
         self._save_history_toggle.set_checked_silent(bool(cfg.get("save_history", True)))
         self._exclude_sensitive_toggle.set_checked_silent(bool(cfg.get("exclude_sensitive", False)))
         self._exclude_sensitive_row.set_helper_text(self._patterns_helper_html())
@@ -1677,6 +1984,21 @@ class SettingsDialog(QDialog):
         self._auto_copy_toggle.set_checked_silent(bool(cfg.get("auto_copy_clipboard", True)))
         self._auto_inject_toggle.set_checked_silent(bool(cfg.get("auto_inject_enabled", False)))
         self._voice_enabled_toggle.set_checked_silent(bool(cfg.get("voice_enabled", False)))
+        recording_mode = str(cfg.get("voice_recording_mode") or "push_to_talk")
+        mode_index = self._voice_recording_mode_combo.findData(recording_mode)
+        self._voice_recording_mode_combo.blockSignals(True)
+        self._voice_recording_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self._voice_recording_mode_combo.blockSignals(False)
+        model_size = str(cfg.get("voice_model_size") or "base").lower()
+        size_index = self._voice_model_size_combo.findData(model_size)
+        self._voice_model_size_combo.blockSignals(True)
+        self._voice_model_size_combo.setCurrentIndex(size_index if size_index >= 0 else 1)
+        self._voice_model_size_combo.blockSignals(False)
+        self._voice_toggle_max_stepper.setValue(
+            int(cfg.get("voice_toggle_max_seconds") or 60), emit=False
+        )
+        self._update_voice_subcontrols(bool(cfg.get("voice_enabled", False)))
+        self._refresh_voice_deps_helper()
 
         self._start_with_windows_toggle.set_checked_silent(is_start_with_windows_enabled())
         self._start_minimized_row.setEnabled(self._start_with_windows_toggle.isChecked())

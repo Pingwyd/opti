@@ -45,6 +45,14 @@ def _seed_entries(path, count: int = 5) -> None:
     path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
 
 
+def test_add_entry_stores_transform(isolated_history, isolated_config):
+    config.load_config()
+    history.add_entry("input", "output", "test-model", transform="tone")
+    entry = history.get_entries(limit=1)[0]
+    assert entry["transform"] == "tone"
+    assert "tone" in entry["tags"]
+
+
 def test_query_entries_keyword_filter(isolated_history):
     _seed_entries(isolated_history, count=4)
     page, total = history.query_entries(keyword="cats", limit=10)
