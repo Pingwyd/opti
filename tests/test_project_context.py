@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 import config
+import projects as projects_mod
 from projects import (
     PROJECT_TYPES,
     create_project,
@@ -23,8 +24,45 @@ from prompt import SYSTEM_PROMPT, build_system_prompt, format_project_context_bl
 @pytest.fixture
 def isolated_config(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
+    projects_path = tmp_path / "projects.json"
     monkeypatch.setattr(config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(projects_mod, "PROJECTS_PATH", projects_path)
+    monkeypatch.setattr(projects_mod, "_legacy_migrated", False)
     return config_path
+
+
+def test_migrate_projects_from_legacy_config(isolated_config, monkeypatch):
+    import json
+
+    isolated_config.write_text(
+        json.dumps(
+            {
+                "provider": "gemini",
+                "projects": {
+                    "legacy-one": {
+                        "name": "Legacy",
+                        "tech_stack": ["Go"],
+                        "project_type": "",
+                        "conventions": "",
+                        "notes": "",
+                        "default_transform": "optimize",
+                        "created": "2026-01-01T00:00:00Z",
+                        "last_used": "2026-01-01T00:00:00Z",
+                        "updated": "2026-01-01T00:00:00Z",
+                    }
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(projects_mod, "_legacy_migrated", False)
+    items = list_projects()
+    assert len(items) == 1
+    assert items[0]["name"] == "Legacy"
+    assert "projects" not in config.load_config()
+    assert projects_mod.PROJECTS_PATH.is_file()
 
 
 def test_slug_from_name_basic():

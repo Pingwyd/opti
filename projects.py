@@ -1,16 +1,27 @@
 """
-Per-project context profiles stored in config.json.
+Per-project context profiles stored in projects.json (user data directory).
+
+active_project remains in config.json. Legacy projects embedded in config.json
+are migrated to projects.json on first access.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
 from config import load_config, save_config
+from paths import ensure_data_dir, get_data_dir
 from prompt import VALID_TRANSFORMS, normalize_transform
+
+log = logging.getLogger(__name__)
+
+PROJECTS_VERSION = 1
+PROJECTS_PATH = get_data_dir() / "projects.json"
 
 PROJECT_TYPES: tuple[str, ...] = (
     "",
@@ -21,6 +32,8 @@ PROJECT_TYPES: tuple[str, ...] = (
     "CLI tool",
     "Other",
 )
+
+_legacy_migrated = False
 
 
 def parse_tech_stack_input(text: str) -> list[str]:
@@ -40,6 +53,7 @@ def parse_tech_stack_input(text: str) -> list[str]:
         seen.add(key)
         result.append(token)
     return result
+
 
 MAX_PROJECTS = 100
 
@@ -68,10 +82,88 @@ def unique_project_id(name: str, projects: dict[str, Any]) -> str:
     return f"{base}-{index}"
 
 
-def _projects_dict() -> dict[str, Any]:
+def _read_projects_file() -> dict[str, Any]:
+    ensure_data_dir()
+    if not PROJECTS_PATH.exists():
+        return {}
+    try:
+        with PROJECTS_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("projects"), dict):
+        return dict(data["projects"])
+    if isinstance(data, dict):
+        return {k: v for k, v in data.items() if isinstance(v, dict)}
+    return {}
+
+
+def save_projects_store(projects: dict[str, Any]) -> None:
+    """Persist all projects to projects.json."""
+    ensure_data_dir()
+    payload = {"version": PROJECTS_VERSION, "projects": deepcopy(projects)}
+    tmp = PROJECTS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(PROJECTS_PATH)
+
+
+def _read_legacy_projects_from_config_file() -> dict[str, Any]:
+    """Read embedded projects from config.json on disk (not via load_config)."""
+    from config import CONFIG_PATH
+
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    legacy = data.get("projects") if isinstance(data, dict) else None
+    return dict(legacy) if isinstance(legacy, dict) else {}
+
+
+def _migrate_legacy_projects_from_config() -> None:
+    global _legacy_migrated
+    if _legacy_migrated:
+        return
+    _legacy_migrated = True
+
+    legacy = _read_legacy_projects_from_config_file()
+    if not legacy:
+        return
+
+    store = _read_projects_file()
+    migrated = 0
+    for project_id, data in legacy.items():
+        if not isinstance(data, dict):
+            continue
+        pid = str(project_id)
+        if pid not in store:
+            store[pid] = deepcopy(data)
+            migrated += 1
+    if migrated:
+        save_projects_store(store)
+        log.info("Migrated %d project(s) from config.json to projects.json", migrated)
+
     cfg = load_config()
-    raw = cfg.get("projects")
-    return dict(raw) if isinstance(raw, dict) else {}
+    if "projects" in cfg:
+        cfg.pop("projects", None)
+        save_config(cfg)
+
+
+def load_projects_store() -> dict[str, Any]:
+    """Return project id → project data (after legacy migration)."""
+    _migrate_legacy_projects_from_config()
+    return _read_projects_file()
+
+
+def replace_projects_store(projects: dict[str, Any]) -> None:
+    """Replace entire projects store (import / restore)."""
+    save_projects_store(projects)
+
+
+def _projects_dict() -> dict[str, Any]:
+    return load_projects_store()
 
 
 def _normalize_project(project: dict[str, Any]) -> dict[str, Any]:
@@ -141,8 +233,7 @@ def create_project(
     if not display_name:
         raise ValueError("Project name cannot be empty.")
 
-    cfg = load_config()
-    projects = dict(cfg.get("projects") or {})
+    projects = dict(_projects_dict())
     if len(projects) >= MAX_PROJECTS:
         raise ValueError(f"Maximum of {MAX_PROJECTS} projects reached.")
 
@@ -169,8 +260,7 @@ def create_project(
         "last_used": now,
         "updated": now,
     }
-    cfg["projects"] = projects
-    save_config(cfg)
+    save_projects_store(projects)
     return project_id
 
 
@@ -189,8 +279,7 @@ def update_project(
     if not display_name:
         raise ValueError("Project name cannot be empty.")
 
-    cfg = load_config()
-    projects = dict(cfg.get("projects") or {})
+    projects = dict(_projects_dict())
     existing = projects.get(project_id)
     if not isinstance(existing, dict):
         raise ValueError(f"Unknown project: {project_id}")
@@ -218,28 +307,27 @@ def update_project(
         "last_used": str(existing.get("last_used") or created),
         "updated": _utc_now_iso(),
     }
-    cfg["projects"] = projects
-    save_config(cfg)
+    save_projects_store(projects)
 
 
 def delete_project(project_id: str) -> None:
-    cfg = load_config()
-    projects = dict(cfg.get("projects") or {})
+    projects = dict(_projects_dict())
     if project_id not in projects:
         raise ValueError(f"Unknown project: {project_id}")
     del projects[project_id]
-    cfg["projects"] = projects
+    save_projects_store(projects)
+    cfg = load_config()
     if cfg.get("active_project") == project_id:
         cfg["active_project"] = None
-    save_config(cfg)
+        save_config(cfg)
 
 
 def set_active_project(project_id: str | None) -> None:
-    cfg = load_config()
     if project_id is not None:
-        projects = cfg.get("projects") or {}
+        projects = _projects_dict()
         if project_id not in projects:
             raise ValueError(f"Unknown project: {project_id}")
+    cfg = load_config()
     cfg["active_project"] = project_id
     save_config(cfg)
 
@@ -254,16 +342,14 @@ def get_active_project() -> dict[str, Any] | None:
 
 def touch_project_last_used(project_id: str) -> None:
     """Update last_used timestamp for a project (e.g. after optimize)."""
-    cfg = load_config()
-    projects = dict(cfg.get("projects") or {})
+    projects = dict(_projects_dict())
     data = projects.get(project_id)
     if not isinstance(data, dict):
         return
     updated = deepcopy(data)
     updated["last_used"] = _utc_now_iso()
     projects[project_id] = updated
-    cfg["projects"] = projects
-    save_config(cfg)
+    save_projects_store(projects)
 
 
 def get_include_project_context_in_private() -> bool:

@@ -5,6 +5,7 @@ vault.json
 # Local user data
 history.json
 draft.json
+projects.json
 
 # Logs and env
 logs/
