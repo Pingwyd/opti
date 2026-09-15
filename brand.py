@@ -9,7 +9,7 @@ from __future__ import annotations
 APP_NAME = "Opti"
 APP_TAGLINE = "Prompt & text transformer"
 APP_SLUG = "opti"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 GITHUB_OWNER = "Pingwyd"
 GITHUB_REPO = "opti"
 GITHUB_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"

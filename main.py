@@ -226,7 +226,10 @@ def main() -> None:
         quit_flag["done"] = True
         log.info("Shutdown: begin")
 
-        # Close modal dialogs (history, settings) so nested exec() returns.
+        from settings_ui import prepare_dialogs_for_application_quit
+
+        prepare_dialogs_for_application_quit(app)
+
         from PyQt6.QtWidgets import QDialog
 
         for widget in app.topLevelWidgets():

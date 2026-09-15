@@ -2389,6 +2389,10 @@ class PopupController(QObject):
         """Thread-safe quit entry (tray menu, hotkeys, etc.)."""
         log.info("Quit requested (marshaling to main thread)")
         self._quit_signal.emit()
+        app = QApplication.instance()
+        if app is not None:
+            # Backup delivery if the queued signal is delayed behind a modal loop.
+            QTimer.singleShot(0, self._quit_main_thread)
 
     @pyqtSlot()
     def _quit_main_thread(self) -> None:

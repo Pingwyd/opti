@@ -73,12 +73,31 @@ pyinstaller packaging/opti.spec --noconfirm --clean
 
 ## Configuration
 
-Settings → tabs for General, Models, Privacy, Shortcuts, Startup, Projects.
+Settings → Connection, Privacy, Shortcuts, Startup, Projects, and **Data** (backup/restore).
+
+### Moving settings from dev to the installed app
+
+Running `python main.py` from source keeps data in the **project folder**. The installer stores data in **`%LOCALAPPDATA%\Opti\`**. They are separate copies.
+
+1. In your dev build: **Settings → Data → Export backup…**
+2. Install or run the release build, then **Settings → Data → Import backup…** (merge or replace).
+
+Backups include API keys in plaintext — store the file securely.
+
+### Project fields (Settings → Projects)
+
+| Field | Purpose |
+| ----- | ------- |
+| **Tech stack** | Comma-separated stack injected as “Tech stack” in prompts |
+| **Conventions** | Rules and architecture the model should follow |
+| **Notes** | Extra reminders (supplementary, not duplicated in conventions) |
 
 Each provider can have its own API key. Keys are encrypted with **DPAPI** in `vault.json` (`dpapi:...`); `config.json` holds non-sensitive settings only. Switching provider in Settings loads that provider's saved key automatically.
 
-**Installed app** stores data in `%LOCALAPPDATA%\Opti\` (`config.json`, `vault.json`, history, drafts)  
+**Installed app** stores data in `%LOCALAPPDATA%\Opti\` (`config.json`, `projects.json`, `vault.json`, history, drafts)  
 **Portable build** stores data next to `Opti.exe`
+
+**Projects** live in **`projects.json`** (not `config.json`). On upgrade, any legacy `projects` block still inside `config.json` is migrated automatically once.
 
 Never commit `config.json` or `vault.json` with real keys.
 
