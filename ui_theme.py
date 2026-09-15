@@ -901,10 +901,12 @@ def settings_stylesheet() -> str:
             border: 1px solid {CORAL};
             border-radius: 7px;
         }}
-        QLabel#keyCapRecording {{
-            color: {CORAL};
+        QLabel#keyCapEmpty {{
+            color: {TEXT_MUTED};
             background: transparent;
-            padding: 0;
+            border: 1px dashed {BORDER_CONTROL};
+            border-radius: 4px;
+            min-width: 32px;
         }}
         QFrame#rowDivider {{
             background: {BORDER_SUBTLE};

@@ -706,7 +706,7 @@ class SettingRow(QWidget):
 
     CONTROL_WIDTH = 190
     CONTROL_WIDTH_WIDE = 280
-    SHORTCUT_CONTROL_WIDTH = 240
+    SHORTCUT_CONTROL_WIDTH = 360
 
     def __init__(
         self,
@@ -774,6 +774,12 @@ class SettingRow(QWidget):
             self._control_box.setFixedWidth(self._control_width)
         if stretch:
             self._control_layout.addWidget(widget)
+        elif isinstance(widget, KeyCapRow):
+            self._control_layout.addWidget(
+                widget,
+                1,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
         else:
             align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             self._control_layout.addWidget(widget, 0, align)
@@ -1032,17 +1038,34 @@ class Stepper(QWidget):
 # KeyCapRow — click-to-record shortcut editor for the Shortcuts pane
 # ---------------------------------------------------------------------------
 
+_KEYCAP_POOL_SIZE = 6
+_MODIFIER_KEY_NAMES: dict[int, str] = {
+    int(Qt.Key.Key_Control): "Ctrl",
+    int(Qt.Key.Key_Shift): "Shift",
+    int(Qt.Key.Key_Alt): "Alt",
+    int(Qt.Key.Key_Meta): "Meta",
+}
+
+
+def split_portable_sequence(sequence: str) -> list[str]:
+    """Split a portable shortcut string into display parts (for tests and UI)."""
+    if not sequence:
+        return ["Unbound"]
+    parts = [p.strip() for p in sequence.split("+") if p.strip()]
+    return parts or ["Unbound"]
+
 
 class KeyCapRow(QWidget):
     """
     Renders a binding as individual keycaps. Click to enter record mode;
-    the next keypress captures the combo, Esc cancels.
+    build the chord with live caps + a trailing empty slot; Esc cancels.
     """
 
     sequence_changed = pyqtSignal(str)
     CAP_H_PAD = 8
     CAP_V_PAD = 4
     CAP_GAP = 4
+    EMPTY_SLOT_WIDTH = 36
 
     def __init__(
         self,
@@ -1054,25 +1077,27 @@ class KeyCapRow(QWidget):
         super().__init__(parent)
         self.setObjectName("keyCapRow")
         self._sequence = initial_sequence
+        self._sequence_before_record = initial_sequence
         self._is_global = is_global
         self._recording = False
         self._conflict = False
         self._conflict_reason = ""
+        self._record_parts: list[str] = []
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(6)
-        outer.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        outer.addStretch(1)
 
         self._check = QLabel("\u2713", self)
         self._check.setObjectName("successCheck")
         self._check.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
         self._check.hide()
-        outer.addWidget(self._check)
+        outer.addWidget(self._check, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._host = QFrame(self)
         self._host.setObjectName("keyCapHost")
@@ -1083,14 +1108,20 @@ class KeyCapRow(QWidget):
         self._host_layout.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
-        outer.addWidget(self._host)
+        self._host.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        outer.addWidget(self._host, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        self._recording_label = QLabel("Press keys", self._host)
-        self._recording_label.setObjectName("keyCapRecording")
-        self._recording_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
-        self._recording_label.setMinimumHeight(self._cap_height())
-        self._recording_label.hide()
-        self._host_layout.addWidget(self._recording_label)
+        self._cap_pool: list[QLabel] = []
+        for _ in range(_KEYCAP_POOL_SIZE):
+            cap = QLabel(self._host)
+            cap.setObjectName("keyCap")
+            cap.hide()
+            self._cap_pool.append(cap)
+
+        self._empty_cap = QLabel(self._host)
+        self._empty_cap.setObjectName("keyCapEmpty")
+        self._empty_cap.setFont(settings_mono_font(FONT_CAPTION))
+        self._empty_cap.hide()
 
         self._render_caps()
 
@@ -1102,21 +1133,22 @@ class KeyCapRow(QWidget):
 
     def set_sequence(self, sequence: str, *, emit: bool = False) -> None:
         self._sequence = sequence
-        self._render_caps()
+        if not self._recording:
+            self._render_caps()
         if emit:
             self.sequence_changed.emit(self._sequence)
 
     def set_registered(self, registered: bool) -> None:
         self._check.setVisible(registered and not self._conflict and not self._recording)
-        hint = self.sizeHint()
-        self.setFixedSize(hint)
+        self._apply_row_geometry()
 
     def set_conflict(self, conflict: bool, reason: str = "") -> None:
         self._conflict = conflict
         self._conflict_reason = reason
         if conflict:
             self._check.hide()
-        self._render_caps()
+        if not self._recording:
+            self._render_caps()
 
     def has_conflict(self) -> bool:
         return self._conflict
@@ -1133,32 +1165,47 @@ class KeyCapRow(QWidget):
         if not self._recording:
             super().keyPressEvent(event)
             return
-        key = event.key()
-        if key == Qt.Key.Key_Escape:
-            self._exit_record_mode()
+        key = int(event.key())
+        if key == int(Qt.Key.Key_Escape):
+            self._exit_record_mode(cancel=True)
             return
-        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+        mod_name = _MODIFIER_KEY_NAMES.get(key)
+        if mod_name is not None:
+            if mod_name not in self._record_parts:
+                self._record_parts.append(mod_name)
+                self._render_recording_caps()
             return
-        modifiers = event.modifiers()
-        seq_int = int(modifiers.value) | key
-        seq = QKeySequence(seq_int).toString(QKeySequence.SequenceFormat.PortableText)
-        self._exit_record_mode()
-        if seq:
-            self.set_sequence(seq, emit=True)
+        seq = QKeySequence(event.keyCombination()).toString(
+            QKeySequence.SequenceFormat.PortableText
+        )
+        if not seq:
+            return
+        self._recording = False
+        self._record_parts.clear()
+        self._sequence = seq
+        self._render_idle_caps()
+        self.sequence_changed.emit(seq)
 
     def focusOutEvent(self, event) -> None:
         if self._recording:
-            self._exit_record_mode()
+            self._exit_record_mode(cancel=True)
         super().focusOutEvent(event)
 
     def _enter_record_mode(self) -> None:
+        self._sequence_before_record = self._sequence
+        self._record_parts.clear()
         self._recording = True
         self.setFocus(Qt.FocusReason.MouseFocusReason)
-        self._render_caps()
+        self._render_recording_caps()
 
-    def _exit_record_mode(self) -> None:
+    def _exit_record_mode(self, *, cancel: bool = False) -> None:
+        if not self._recording:
+            return
         self._recording = False
-        self._render_caps()
+        self._record_parts.clear()
+        if cancel:
+            self._sequence = self._sequence_before_record
+        self._render_idle_caps()
 
     def _cap_height(self) -> int:
         return QFontMetrics(settings_mono_font(FONT_CAPTION)).height() + self.CAP_V_PAD * 2
@@ -1178,68 +1225,111 @@ class KeyCapRow(QWidget):
 
     def _cap_width_for(self, part: str) -> int:
         fm = QFontMetrics(settings_mono_font(FONT_CAPTION))
-        return fm.horizontalAdvance(part) + self.CAP_H_PAD * 2 + 2
+        text_w = max(fm.horizontalAdvance(part), fm.boundingRect(part).width())
+        return max(text_w + self.CAP_H_PAD * 2 + 8, 32)
+
+    def _sequence_parts(self) -> list[str]:
+        return split_portable_sequence(self._sequence)
+
+    def _width_for_parts(self, parts: list[str], *, include_empty_slot: bool) -> int:
+        total = sum(self._cap_width_for(part) for part in parts)
+        count = len(parts) + (1 if include_empty_slot else 0)
+        if count > 1:
+            total += self.CAP_GAP * (count - 1)
+        if include_empty_slot:
+            total += self.EMPTY_SLOT_WIDTH
+        return max(total, self.EMPTY_SLOT_WIDTH if include_empty_slot else 48)
 
     def _content_width(self) -> int:
         if self._recording:
-            fm = QFontMetrics(self._recording_label.font())
-            return fm.horizontalAdvance("Press keys") + self.CAP_H_PAD * 2
-        parts = [p for p in self._sequence.split("+") if p] if self._sequence else ["Unbound"]
-        total = sum(self._cap_width_for(part) for part in parts)
-        if len(parts) > 1:
-            total += self.CAP_GAP * (len(parts) - 1)
-        return max(total, 48)
+            return self._width_for_parts(self._record_parts, include_empty_slot=True) + 16
+        return self._width_for_parts(self._sequence_parts(), include_empty_slot=False)
 
     def sizeHint(self) -> QSize:
         height = self._cap_height() + 4
-        width = self._content_width()
-        if self._recording:
-            width += 12  # host horizontal margins while recording
-        if self._check.isVisible():
-            width += self._check.sizeHint().width() + 6
+        parent = self.parentWidget()
+        width = (
+            parent.width()
+            if parent is not None and parent.width() > 0
+            else SettingRow.SHORTCUT_CONTROL_WIDTH
+        )
         return QSize(width, height)
 
     def minimumSizeHint(self) -> QSize:
-        return self.sizeHint()
+        return QSize(0, self.sizeHint().height())
 
-    def _clear_host(self) -> None:
+    def _detach_host_layout(self) -> None:
         while self._host_layout.count():
             item = self._host_layout.takeAt(0)
             widget = item.widget()
-            if widget is not None and widget is not self._recording_label:
-                widget.deleteLater()
+            if widget is not None:
+                widget.hide()
+
+    def _apply_row_geometry(self) -> None:
+        height = self._cap_height() + 4
+        self.setMinimumHeight(height)
+        self.setMaximumHeight(height)
+        self._host.setMinimumWidth(self._content_width())
+        self._host.setMaximumWidth(self._content_width())
+        self.updateGeometry()
+        self._notify_row_resize()
+
+    def _configure_filled_cap(self, cap: QLabel, part: str) -> None:
+        cap.setText(part)
+        cap.setProperty("conflict", "true" if self._conflict else "false")
+        cap.setFont(settings_mono_font(FONT_CAPTION))
+        cap.setStyleSheet(self._cap_style())
+        cap.setFixedHeight(self._cap_height())
+        cap.setFixedWidth(self._cap_width_for(part))
+        cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cap.show()
+
+    def _configure_empty_cap(self) -> None:
+        self._empty_cap.setText("")
+        self._empty_cap.setFixedHeight(self._cap_height())
+        self._empty_cap.setFixedWidth(self.EMPTY_SLOT_WIDTH)
+        self._empty_cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_cap.show()
 
     def _render_caps(self) -> None:
-        self._clear_host()
-        self._host.setProperty("recording", "true" if self._recording else "false")
+        if self._recording:
+            self._render_recording_caps()
+        else:
+            self._render_idle_caps()
+
+    def _render_idle_caps(self) -> None:
+        self._detach_host_layout()
+        self._host.setProperty("recording", "false")
         self._host.style().unpolish(self._host)
         self._host.style().polish(self._host)
+        self._host_layout.setContentsMargins(0, 0, 0, 0)
 
-        if self._recording:
-            self._check.hide()
-            self._host_layout.setContentsMargins(6, 4, 6, 4)
-            self._recording_label.show()
-            self._host_layout.addWidget(self._recording_label)
-        else:
-            self._host_layout.setContentsMargins(0, 0, 0, 0)
-            self._recording_label.hide()
-            parts = [p for p in self._sequence.split("+") if p] if self._sequence else []
-            if not parts:
-                parts = ["Unbound"]
-            for part in parts:
-                cap = QLabel(part, self._host)
-                cap.setObjectName("keyCap")
-                cap.setProperty("conflict", "true" if self._conflict else "false")
-                cap.setFont(settings_mono_font(FONT_CAPTION))
-                cap.setStyleSheet(self._cap_style())
-                cap.setFixedHeight(self._cap_height())
-                cap.setFixedWidth(self._cap_width_for(part))
-                cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self._host_layout.addWidget(cap)
+        parts = self._sequence_parts()
+        for index, part in enumerate(parts):
+            if index >= len(self._cap_pool):
+                break
+            self._configure_filled_cap(self._cap_pool[index], part)
+            self._host_layout.addWidget(self._cap_pool[index])
 
-        hint = self.sizeHint()
-        self.setFixedSize(hint)
-        self._notify_row_resize()
+        self._apply_row_geometry()
+
+    def _render_recording_caps(self) -> None:
+        self._detach_host_layout()
+        self._host.setProperty("recording", "true")
+        self._host.style().unpolish(self._host)
+        self._host.style().polish(self._host)
+        self._host_layout.setContentsMargins(8, 4, 8, 4)
+        self._check.hide()
+
+        for index, part in enumerate(self._record_parts):
+            if index >= len(self._cap_pool):
+                break
+            self._configure_filled_cap(self._cap_pool[index], part)
+            self._host_layout.addWidget(self._cap_pool[index])
+
+        self._configure_empty_cap()
+        self._host_layout.addWidget(self._empty_cap)
+        self._apply_row_geometry()
 
     def _notify_row_resize(self) -> None:
         widget: QWidget | None = self.parentWidget()
@@ -1318,6 +1408,10 @@ def render_nav_icon(kind: str, color: str, size: int = 18) -> QPixmap:
         path.lineTo(3, size - 4)
         path.closeSubpath()
         painter.drawPath(path)
+    elif kind == "data":
+        painter.drawRoundedRect(QRectF(3, 4, size - 6, size - 7), 2, 2)
+        painter.drawLine(QPointF(size / 2, 7), QPointF(size / 2, size - 5))
+        painter.drawLine(QPointF(6, 10), QPointF(size - 6, 10))
     painter.end()
     return pm
 
