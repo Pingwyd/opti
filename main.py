@@ -43,6 +43,7 @@ from icons import app_icon, make_tray_icon_image  # noqa: E402
 from log_config import setup_logging  # noqa: E402
 from popup import init_controller  # noqa: E402
 from settings_ui import SettingsDialog  # noqa: E402
+from updates import check_for_updates  # noqa: E402
 from startup import (  # noqa: E402
     apply_start_with_windows_from_config,
     disable_start_with_windows,
@@ -291,7 +292,26 @@ def main() -> None:
     _hotkey_service.start(_global_hotkey_bindings())
 
     if get_check_updates_on_launch():
-        log.debug("Update check on launch is enabled (stub — not implemented)")
+
+        def _launch_update_check() -> None:
+            try:
+                result = check_for_updates()
+            except Exception:
+                log.debug("Update check on launch failed", exc_info=True)
+                return
+            if result.status == "update_available":
+                log.info(
+                    "Update available: %s → %s (%s)",
+                    result.current_version,
+                    result.latest_version,
+                    result.release_url or "",
+                )
+            elif result.status == "error":
+                log.debug("Update check on launch: %s", result.error_message)
+            else:
+                log.debug("On latest release (%s)", result.latest_version or APP_VERSION)
+
+        threading.Thread(target=_launch_update_check, daemon=True).start()
 
     if not get_start_minimized_to_tray():
         controller.show_expanded(capture_inject_target=False)

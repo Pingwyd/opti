@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from brand import APP_NAME, APP_VERSION, SETTINGS_TITLE, SETUP_TITLE
+from brand import APP_NAME, APP_VERSION, GITHUB_URL, SETTINGS_TITLE, SETUP_TITLE
 from config import (
     DEFAULT_HOTKEY,
     DEFAULT_HOTKEY_COLLAPSE,
@@ -70,6 +70,7 @@ from config import (
 )
 from history import DEFAULT_SENSITIVE_KEYWORDS, counts_by_project_name
 from hotkey_service import parse_hotkey_to_pynput
+from updates import UpdateCheckResult, check_for_updates
 from backup import ImportMode, backup_summary, export_to_path, import_from_path, load_backup_from_path
 from paths import get_data_dir
 from projects import (
@@ -745,6 +746,8 @@ class _ProjectListItem(QWidget):
 class SettingsDialog(QDialog):
     """Sidebar-navigated, immediate-apply settings window."""
 
+    update_check_finished = pyqtSignal(object)
+
     PANE_DEFS: list[tuple[str, str, str]] = [
         ("connection", "Connection", "connection"),
         ("privacy", "Privacy", "privacy"),
@@ -785,6 +788,7 @@ class SettingsDialog(QDialog):
         self._last_good_shortcuts: dict[str, str] = {}
         self._shortcut_caps: dict[str, KeyCapRow] = {}
         self._shortcut_rows: dict[str, SettingRow] = {}
+        self._update_check_in_progress = False
 
         self.setObjectName("settingsDialog")
         self.setWindowTitle(SETUP_TITLE if first_run else SETTINGS_TITLE)
@@ -796,6 +800,7 @@ class SettingsDialog(QDialog):
         self._writer = DebouncedConfigWriter(400, self)
         self._writer.saved.connect(self._on_config_saved)
         self._writer.task_done.connect(self._on_project_task_done)
+        self.update_check_finished.connect(self._on_update_check_finished)
 
         self._geometry_timer = QTimer(self)
         self._geometry_timer.setSingleShot(True)
@@ -1567,8 +1572,74 @@ class SettingsDialog(QDialog):
         self._start_minimized_row.setEnabled(checked)
         self._write({"start_with_windows": checked})
 
-    def _on_check_updates_now(self, _href: str) -> None:
-        pass  # stub — not implemented
+    def _updates_helper_html(
+        self, middle: str = "", *, include_check_link: bool = True
+    ) -> str:
+        parts = [f"Version {APP_VERSION}"]
+        if middle:
+            parts.append(middle)
+        if include_check_link:
+            parts.append(
+                f"<a href='#' style='color:{CORAL}; text-decoration:none;'>Check now</a>"
+            )
+        return " \u00b7 ".join(parts)
+
+    def _set_updates_helper(
+        self,
+        middle: str = "",
+        *,
+        success: bool = False,
+        danger: bool = False,
+        include_check_link: bool = True,
+    ) -> None:
+        self._check_updates_row.set_helper_text(
+            self._updates_helper_html(middle, include_check_link=include_check_link),
+            success=success,
+            danger=danger,
+        )
+
+    def _on_updates_helper_link(self, href: str) -> None:
+        if href in ("", "#"):
+            self._start_update_check()
+            return
+        QDesktopServices.openUrl(QUrl(href))
+
+    def _start_update_check(self) -> None:
+        if self._update_check_in_progress:
+            return
+        self._update_check_in_progress = True
+        self._set_updates_helper("Checking for updates\u2026", include_check_link=False)
+
+        def worker() -> None:
+            result = check_for_updates()
+            try:
+                self.update_check_finished.emit(result)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_check_finished(self, result: object) -> None:
+        self._update_check_in_progress = False
+        if not isinstance(result, UpdateCheckResult):
+            self._set_updates_helper("Update check failed.", danger=True)
+            return
+        if result.status == "up_to_date":
+            label = "You're on the latest release"
+            if result.latest_version:
+                label += f" ({result.latest_version})"
+            self._set_updates_helper(label, success=True)
+        elif result.status == "update_available":
+            latest = result.latest_version or "?"
+            url = result.release_url or GITHUB_URL
+            self._set_updates_helper(
+                f"<a href='{url}' style='color:{CORAL}; text-decoration:none;'>"
+                f"Update {latest} available</a>",
+                success=True,
+            )
+        else:
+            msg = result.error_message or "Update check failed."
+            self._set_updates_helper(msg, danger=True)
 
     def _on_reset_window_position_clicked(self) -> None:
         if self._on_reset_window_position is not None:
@@ -1594,12 +1665,12 @@ class SettingsDialog(QDialog):
 
         self._check_updates_row = SettingRow(
             "Check for updates on launch",
-            f"Version {APP_VERSION} \u00b7 "
-            f"<a href='#' style='color:{CORAL}; text-decoration:none;'>Check now</a>",
+            self._updates_helper_html(),
         )
-        self._check_updates_row.helper_widget().linkActivated.connect(
-            self._on_check_updates_now
-        )
+        updates_helper = self._check_updates_row.helper_widget()
+        updates_helper.setTextFormat(Qt.TextFormat.RichText)
+        updates_helper.setOpenExternalLinks(False)
+        updates_helper.linkActivated.connect(self._on_updates_helper_link)
         self._check_updates_toggle = ToggleSwitch()
         self._check_updates_toggle.toggled.connect(
             lambda v: self._write({"check_updates_on_launch": v})
