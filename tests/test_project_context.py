@@ -193,3 +193,45 @@ def test_build_system_prompt_private_mode_optional_include():
     result = build_system_prompt(project, private_mode=True, include_in_private=True)
     assert "Project context" in result
     assert SYSTEM_PROMPT in result
+
+
+def test_project_default_transform_round_trip(isolated_config):
+    config.load_config()
+    project_id = create_project(name="Writing", default_transform="tone")
+    project = get_active_project() or list_projects()[0]
+    assert project["default_transform"] == "tone"
+
+    update_project(
+        project_id,
+        name="Writing",
+        tech_stack=[],
+        project_type="",
+        conventions="",
+        notes="",
+        default_transform="extract",
+    )
+    updated = list_projects()[0]
+    assert updated["default_transform"] == "extract"
+
+
+def test_create_project_rejects_invalid_default_transform(isolated_config):
+    config.load_config()
+    with pytest.raises(ValueError, match="default_transform"):
+        create_project(name="Bad", default_transform="refine")
+
+
+def test_get_effective_transform_matches_session_transform(isolated_config):
+    config.load_config()
+    config.set_transform("summarize")
+    assert config.get_effective_transform() == "summarize"
+
+
+def test_project_default_transform_applied_on_switch(isolated_config):
+    config.load_config()
+    config.set_transform("summarize")
+    project_id = create_project(name="Email", default_transform="tone")
+    set_active_project(project_id)
+    project = get_active_project()
+    assert project is not None
+    config.set_transform(str(project.get("default_transform")))
+    assert config.get_effective_transform() == "tone"

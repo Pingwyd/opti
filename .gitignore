@@ -1,5 +1,6 @@
 ﻿# Local MetaPrompt settings — do not commit real API keys.
 config.json
+vault.json
 
 # Local user data
 history.json

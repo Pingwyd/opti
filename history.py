@@ -60,6 +60,8 @@ def _normalize_entry(entry: dict[str, Any]) -> dict[str, Any]:
         normalized["excluded_from_save"] = False
     if "project_name" not in normalized:
         normalized["project_name"] = None
+    if "transform" not in normalized:
+        normalized["transform"] = "optimize"
     return normalized
 
 
@@ -102,6 +104,7 @@ def add_entry(
     tags: list[str] | None = None,
     excluded_from_save: bool = False,
     project_name: str | None = None,
+    transform: str | None = None,
 ) -> None:
     """Prepend a new history entry, trimming to history_limit."""
     if _should_skip_save(input_text, excluded_from_save):
@@ -110,13 +113,18 @@ def add_entry(
     cfg = load_config()
     limit = int(cfg.get("history_limit") or 50)
     entries = _read_all()
+    mode = (transform or "optimize").lower().strip() or "optimize"
+    tag_list = list(tags or [])
+    if mode and mode not in tag_list:
+        tag_list.insert(0, mode)
     entry: dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "input": input_text,
             "output": output_text,
             "model": model,
-            "tags": list(tags or []),
+            "transform": mode,
+            "tags": tag_list,
             "excluded_from_save": False,
         }
     if project_name:

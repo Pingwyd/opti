@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from config import load_config, save_config
+from prompt import VALID_TRANSFORMS, normalize_transform
 
 PROJECT_TYPES: tuple[str, ...] = (
     "",
@@ -90,6 +91,8 @@ def _normalize_project(project: dict[str, Any]) -> dict[str, Any]:
         "project_type": project_type,
         "conventions": str(project.get("conventions") or "").strip(),
         "notes": str(project.get("notes") or "").strip(),
+        "inject_process": str(project.get("inject_process") or "").strip(),
+        "default_transform": normalize_transform(project.get("default_transform")),
         "created": created,
         "last_used": str(project.get("last_used") or created),
         "updated": str(project.get("updated") or created),
@@ -131,6 +134,7 @@ def create_project(
     project_type: str = "",
     conventions: str = "",
     notes: str = "",
+    default_transform: str = "optimize",
 ) -> str:
     """Create a project and return its id. Raises ValueError on validation failure."""
     display_name = (name or "").strip()
@@ -148,12 +152,19 @@ def create_project(
     if ptype not in PROJECT_TYPES:
         ptype = ""
 
+    transform = normalize_transform(default_transform)
+    if (default_transform or "").strip().lower() not in VALID_TRANSFORMS:
+        raise ValueError(
+            f"default_transform must be one of: {', '.join(VALID_TRANSFORMS)}"
+        )
+
     projects[project_id] = {
         "name": display_name,
         "tech_stack": [t.strip() for t in (tech_stack or []) if t.strip()],
         "project_type": ptype,
         "conventions": (conventions or "").strip(),
         "notes": (notes or "").strip(),
+        "default_transform": transform,
         "created": now,
         "last_used": now,
         "updated": now,
@@ -171,6 +182,8 @@ def update_project(
     project_type: str = "",
     conventions: str = "",
     notes: str = "",
+    inject_process: str = "",
+    default_transform: str = "optimize",
 ) -> None:
     display_name = (name or "").strip()
     if not display_name:
@@ -186,6 +199,12 @@ def update_project(
     if ptype not in PROJECT_TYPES:
         ptype = ""
 
+    transform = normalize_transform(default_transform)
+    if (default_transform or "").strip().lower() not in VALID_TRANSFORMS:
+        raise ValueError(
+            f"default_transform must be one of: {', '.join(VALID_TRANSFORMS)}"
+        )
+
     created = str(existing.get("created") or _utc_now_iso())
     projects[project_id] = {
         "name": display_name,
@@ -193,6 +212,8 @@ def update_project(
         "project_type": ptype,
         "conventions": (conventions or "").strip(),
         "notes": (notes or "").strip(),
+        "inject_process": (inject_process or "").strip(),
+        "default_transform": transform,
         "created": created,
         "last_used": str(existing.get("last_used") or created),
         "updated": _utc_now_iso(),

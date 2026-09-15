@@ -1,15 +1,16 @@
 # Opti
 
-**Opti** is a lightweight Windows tray app that refines rough AI prompts into clear, well-engineered ones — summoned with a global hotkey, Spotlight-style.
+**Opti** is a lightweight Windows tray app that transforms text in place — prompts, messages, summaries, and key extractions — summoned with a global hotkey, Spotlight-style.
 
-Tagline: *Prompt refiner*
+Tagline: *Prompt & text transformer*
 
-**Default provider:** Google Gemini 3.5 Flash (free-tier friendly). Switch to Groq, OpenRouter, or Anthropic in Settings.
+**Default provider:** Google Gemini 3.5 Flash (free-tier friendly). Switch to Groq, OpenRouter, Anthropic, or OpenAI in Settings.
 
 ## Features
 
 - Global hotkey pill UI (collapse to floating chip)
-- Project context profiles
+- Transform modes: Optimize prompt, Polish message, Summarize, Extract (80/20), Ask
+- Project context profiles with per-project default transform
 - Voice input (optional, local Whisper)
 - Auto-inject into previous window (opt-in)
 - History, privacy mode, configurable shortcuts
@@ -39,21 +40,27 @@ Optional voice input:
 pip install -r requirements-voice.txt
 ```
 
+Then enable **Settings → Privacy → Voice input**. The first run downloads the Whisper model (~150MB for `base`). Use the mic button on the prompt bar, or hold **Ctrl+Space** (default) while the popup is focused. Configure recording mode, model size, and shortcut under **Privacy** and **Shortcuts**.
+
 ## Download (releases)
 
-GitHub Actions builds on every `v*` tag:
+GitHub Actions **Build & Release** runs on pull requests (tests + artifacts only) and publishes a GitHub Release when changes land on **`main`** (or when you push a `v*` tag).
 
 | Artifact | Description |
 |----------|-------------|
 | **Opti-Setup-x.x.x.exe** | Windows installer (Inno Setup) — data in `%LOCALAPPDATA%\Opti` |
 | **Opti-portable.zip** | Unzip and run `Opti.exe` — config/logs beside the exe (`portable.txt` marker) |
 
-Trigger a build manually: **Actions → Build & Release → Run workflow**, or push a tag:
+**Ship a release:** bump `APP_VERSION` in `brand.py`, update `CHANGELOG.md`, merge to `main`. CI tags `vX.Y.Z` from that version and uploads the installer + portable zip.
+
+Optional manual tag (same version as `brand.py`):
 
 ```powershell
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
+
+Dry-run build only: **Actions → Build & Release → Run workflow** (no release on manual runs unless you push to `main` or a tag).
 
 ## Build locally
 
@@ -68,12 +75,12 @@ pyinstaller packaging/opti.spec --noconfirm --clean
 
 Settings → tabs for General, Models, Privacy, Shortcuts, Startup, Projects.
 
-On Windows, API keys are encrypted with **DPAPI** in `config.json` (`dpapi:...`).
+Each provider can have its own API key. Keys are encrypted with **DPAPI** in `vault.json` (`dpapi:...`); `config.json` holds non-sensitive settings only. Switching provider in Settings loads that provider's saved key automatically.
 
-**Installed app** stores data in `%LOCALAPPDATA%\Opti\`  
+**Installed app** stores data in `%LOCALAPPDATA%\Opti\` (`config.json`, `vault.json`, history, drafts)  
 **Portable build** stores data next to `Opti.exe`
 
-Never commit `config.json` with real keys.
+Never commit `config.json` or `vault.json` with real keys.
 
 ## Tests
 

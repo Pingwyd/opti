@@ -84,6 +84,7 @@ def compute_rms(samples: Any) -> float:
     return float(np.sqrt(mean_sq))
 
 
+CancelCallback = Callable[[], bool]
 ProgressCallback = Callable[[int, int], None]
 LevelCallback = Callable[[float], None]
 
@@ -158,13 +159,19 @@ class VoiceTranscriber:
         model_size: str = "base",
         *,
         on_download_progress: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
     ) -> None:
         if not FASTER_WHISPER_AVAILABLE:
             raise RuntimeError(missing_voice_deps_message())
         self._model_size = model_size
         self._on_download_progress = on_download_progress
+        self._cancel_check = cancel_check
         self._model: Any | None = None
         self._model_lock = threading.Lock()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_check is not None and self._cancel_check():
+            raise InterruptedError("Transcription cancelled")
 
     @property
     def model_size(self) -> str:
@@ -174,9 +181,11 @@ class VoiceTranscriber:
         return self._model is not None
 
     def load_model(self) -> None:
+        self._check_cancelled()
         if self._model is not None:
             return
         with self._model_lock:
+            self._check_cancelled()
             if self._model is not None:
                 return
             self._report_progress(0, 100)
@@ -196,8 +205,10 @@ class VoiceTranscriber:
 
     def _create_model(self) -> Any:
         assert WhisperModel is not None
+        self._check_cancelled()
         self._report_progress(25, 100)
         model = WhisperModel(self._model_size, device="cpu", compute_type="int8")
+        self._check_cancelled()
         self._report_progress(100, 100)
         return model
 
@@ -207,7 +218,9 @@ class VoiceTranscriber:
         samples = np.asarray(audio, dtype=np.float32)
         if samples.size == 0:
             return ""
+        self._check_cancelled()
         self.load_model()
+        self._check_cancelled()
         assert self._model is not None
         segments, _info = self._model.transcribe(
             samples,
@@ -216,6 +229,7 @@ class VoiceTranscriber:
         )
         parts: list[str] = []
         for segment in segments:
+            self._check_cancelled()
             text = str(getattr(segment, "text", "") or "").strip()
             if text:
                 parts.append(text)

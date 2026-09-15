@@ -1,22 +1,21 @@
 """
 Load and save Opti settings from config.json in the user data directory.
 
-API keys are never logged — callers should treat get_api_key() as sensitive.
+API keys are stored per provider in vault.json (DPAPI) — see vault.py.
+Callers should treat get_api_key() as sensitive.
 
-Set "provider" to one of: gemini | groq | openrouter | anthropic
+Set "provider" to one of: gemini | groq | openrouter | anthropic | openai
 """
 
 from __future__ import annotations
 
 import json
-import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-import secrets
-
 from paths import BUNDLE_DIR, ensure_data_dir, get_data_dir
+from prompt import VALID_TRANSFORMS, normalize_transform
 
 # Legacy alias — bundle/source root (not always writable when frozen)
 APP_DIR = BUNDLE_DIR
@@ -49,6 +48,12 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "env_keys": ("ANTHROPIC_API_KEY",),
         "label": "Anthropic",
     },
+    "openai": {
+        "model": "gpt-4o",
+        "model_fast": "gpt-4o-mini",
+        "env_keys": ("OPENAI_API_KEY",),
+        "label": "OpenAI",
+    },
 }
 
 VALID_PROVIDERS = tuple(PROVIDER_PRESETS.keys())
@@ -58,6 +63,7 @@ VALID_PROVIDERS = tuple(PROVIDER_PRESETS.keys())
 MODEL_ID_PREFIXES: dict[str, tuple[str, ...]] = {
     "gemini": ("gemini-",),
     "anthropic": ("claude-",),
+    "openai": ("gpt-", "o1", "o3", "o4", "chatgpt-"),
     "groq": ("llama-", "mixtral-", "gemma-", "deepseek-", "qwen-", "openai/gpt-"),
     "openrouter": (
         "google/",
@@ -91,6 +97,8 @@ DEFAULT_HOTKEY_COLLAPSE = "Ctrl+Alt+M"
 DEFAULT_SHORTCUT_COLLAPSE = "Ctrl+Shift+M"
 DEFAULT_SHORTCUT_HIDE_TRAY = "Escape"
 DEFAULT_SHORTCUT_PRIVATE = "Ctrl+Shift+P"
+DEFAULT_SHORTCUT_TRANSFORM_CYCLE = "Ctrl+T"
+DEFAULT_SHORTCUT_TRANSFORM_CYCLE_REVERSE = "Ctrl+Shift+T"
 RESCUE_WINDOW_SHORTCUT = "Ctrl+Shift+R"
 DEFAULT_VOICE_PTT_SHORTCUT = "Ctrl+Space"
 VALID_VOICE_MODEL_SIZES = ("tiny", "base", "small", "medium")
@@ -100,13 +108,16 @@ VALID_VOICE_RECORDING_MODES = ("push_to_talk", "toggle")
 # Defaults: Gemini free tier (Flash), not a paid Pro model
 DEFAULT_CONFIG: dict[str, Any] = {
     "provider": "gemini",
-    "api_key": "",
     "hotkey": DEFAULT_HOTKEY,
     "hotkey_collapse": DEFAULT_HOTKEY_COLLAPSE,
     "model": PROVIDER_PRESETS["gemini"]["model"],
     "model_fast": PROVIDER_PRESETS["gemini"]["model_fast"],
     # "thorough" uses `model`; "fast" uses `model_fast`
     "mode": "thorough",
+    # Transform intent: optimize | tone | summarize | extract (separate from speed mode)
+    "transform": "optimize",
+    "transform_preset": "",
+    "prefill_from_clipboard": False,
     "history_limit": 50,
     "save_history": True,
     "exclude_sensitive": False,
@@ -132,8 +143,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "shortcut_collapse": DEFAULT_SHORTCUT_COLLAPSE,
     "shortcut_hide_tray": DEFAULT_SHORTCUT_HIDE_TRAY,
     "shortcut_private": DEFAULT_SHORTCUT_PRIVATE,
+    "shortcut_transform_cycle": DEFAULT_SHORTCUT_TRANSFORM_CYCLE,
+    "shortcut_transform_cycle_reverse": DEFAULT_SHORTCUT_TRANSFORM_CYCLE_REVERSE,
     "auto_copy_clipboard": True,
     "auto_inject_enabled": False,
+    "inject_target_mode": "dynamic",
+    "inject_pinned_hwnd": None,
     "projects": {},
     "active_project": None,
     "include_project_context_in_private": False,
@@ -208,9 +223,13 @@ def load_config() -> dict[str, Any]:
         # Older configs had no provider field — persist gemini explicitly
         migrated = True
 
-    stored_key = merged.get("api_key")
-    if isinstance(stored_key, str) and stored_key.strip() and not secrets.is_encrypted(stored_key):
-        merged["api_key"] = secrets.encrypt(stored_key.strip())
+    legacy_key = merged.pop("api_key", None)
+    if isinstance(legacy_key, str) and legacy_key.strip():
+        from vault import migrate_legacy_api_key
+
+        migrate_legacy_api_key(legacy_key, provider)
+        migrated = True
+    elif legacy_key is not None:
         migrated = True
 
     if migrated:
@@ -230,6 +249,7 @@ def save_config(config: dict[str, Any]) -> None:
         except (json.JSONDecodeError, OSError):
             existing = {}
     existing.update(config)
+    existing.pop("api_key", None)  # keys live in vault.json
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2)
         f.write("\n")
@@ -334,27 +354,23 @@ def set_provider(provider: str, reset_models: bool = True) -> None:
 
 
 def get_api_key() -> str:
-    """Return API key from config, or from the active provider's env vars."""
-    cfg = load_config()
-    stored = (cfg.get("api_key") or "").strip()
-    if stored:
-        try:
-            return secrets.decrypt(stored)
-        except (OSError, ValueError):
-            return stored
-    provider = get_provider()
-    for env_name in PROVIDER_PRESETS[provider]["env_keys"]:
-        val = (os.environ.get(env_name) or "").strip()
-        if val:
-            return val
-    return ""
+    """Return API key for the active provider (vault, then env vars)."""
+    from vault import resolve_api_key
+
+    return resolve_api_key(get_provider())
 
 
-def set_api_key(api_key: str) -> None:
-    cfg = load_config()
-    plain = api_key.strip()
-    cfg["api_key"] = secrets.encrypt(plain) if plain else ""
-    save_config(cfg)
+def set_api_key(api_key: str, *, provider: str | None = None) -> None:
+    from vault import set_stored_key
+
+    set_stored_key(provider or get_provider(), api_key)
+
+
+def has_stored_key_for_provider(provider: str) -> bool:
+    """True when vault has a saved key for provider (ignores env vars)."""
+    from vault import has_stored_key
+
+    return has_stored_key(provider)
 
 
 def has_api_key() -> bool:
@@ -379,6 +395,55 @@ def set_mode(mode: str) -> None:
     cfg = load_config()
     cfg["mode"] = mode
     save_config(cfg)
+
+
+def get_transform() -> str:
+    """Return the global default transform (when no active project override applies)."""
+    return normalize_transform(load_config().get("transform"))
+
+
+def set_transform(transform: str) -> None:
+    key = (transform or "").lower().strip()
+    if key not in VALID_TRANSFORMS:
+        raise ValueError(f"transform must be one of: {', '.join(VALID_TRANSFORMS)}")
+    cfg = load_config()
+    cfg["transform"] = key
+    save_config(cfg)
+
+
+def get_transform_preset() -> str:
+    return str(load_config().get("transform_preset") or "").strip()
+
+
+def set_transform_preset(preset: str) -> None:
+    cfg = load_config()
+    cfg["transform_preset"] = str(preset or "").strip()
+    save_config(cfg)
+
+
+def get_prefill_from_clipboard() -> bool:
+    return bool(load_config().get("prefill_from_clipboard", False))
+
+
+def set_prefill_from_clipboard(enabled: bool) -> None:
+    cfg = load_config()
+    cfg["prefill_from_clipboard"] = bool(enabled)
+    save_config(cfg)
+
+
+def get_effective_transform() -> str:
+    """
+    Return the transform used for the current session.
+
+    Project defaults are applied by calling ``set_transform`` when the active
+    project changes (see popup project selector).
+    """
+    return get_transform()
+
+
+def get_effective_transform_preset() -> str:
+    """Return transform preset (global for now; project presets in Tier 2)."""
+    return get_transform_preset()
 
 
 def provider_label() -> str:
@@ -739,13 +804,14 @@ def set_hotkey_collapse(hotkey: str) -> None:
     save_config(cfg)
 
 
-def in_app_shortcuts_conflict(collapse: str, hide: str, private: str) -> bool:
+def in_app_shortcuts_conflict(*shortcuts: str) -> bool:
     """True when any two in-app shortcuts resolve to the same key sequence."""
-    return (
-        shortcuts_equal(collapse, hide)
-        or shortcuts_equal(collapse, private)
-        or shortcuts_equal(hide, private)
-    )
+    items = [s for s in shortcuts if s]
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            if shortcuts_equal(items[i], items[j]):
+                return True
+    return False
 
 
 def global_hotkeys_conflict(hotkey: str, hotkey_collapse: str) -> bool:
@@ -760,12 +826,13 @@ def hotkey_conflicts_with_shortcuts(
     private: str = "",
     *,
     hotkey_collapse: str = "",
+    extra_in_app_shortcuts: tuple[str, ...] = (),
 ) -> bool:
     """True when any global hotkey matches an in-app shortcut or each other."""
     keys = [hotkey]
     if hotkey_collapse:
         keys.append(hotkey_collapse)
-    shortcuts = [collapse, hide]
+    shortcuts = [collapse, hide, *extra_in_app_shortcuts]
     if private:
         shortcuts.append(private)
     for g in keys:
@@ -816,6 +883,36 @@ def set_shortcut_private(shortcut: str) -> None:
     save_config(cfg)
 
 
+def get_shortcut_transform_cycle() -> str:
+    return normalize_shortcut_string(
+        str(load_config().get("shortcut_transform_cycle") or ""),
+        DEFAULT_SHORTCUT_TRANSFORM_CYCLE,
+    )
+
+
+def set_shortcut_transform_cycle(shortcut: str) -> None:
+    cfg = load_config()
+    cfg["shortcut_transform_cycle"] = normalize_shortcut_string(
+        shortcut, DEFAULT_SHORTCUT_TRANSFORM_CYCLE
+    )
+    save_config(cfg)
+
+
+def get_shortcut_transform_cycle_reverse() -> str:
+    return normalize_shortcut_string(
+        str(load_config().get("shortcut_transform_cycle_reverse") or ""),
+        DEFAULT_SHORTCUT_TRANSFORM_CYCLE_REVERSE,
+    )
+
+
+def set_shortcut_transform_cycle_reverse(shortcut: str) -> None:
+    cfg = load_config()
+    cfg["shortcut_transform_cycle_reverse"] = normalize_shortcut_string(
+        shortcut, DEFAULT_SHORTCUT_TRANSFORM_CYCLE_REVERSE
+    )
+    save_config(cfg)
+
+
 def get_start_minimized_to_tray() -> bool:
     return bool(load_config().get("start_minimized_to_tray", True))
 
@@ -841,6 +938,40 @@ def get_auto_inject_enabled() -> bool:
 def set_auto_inject_enabled(enabled: bool) -> None:
     cfg = load_config()
     cfg["auto_inject_enabled"] = bool(enabled)
+    save_config(cfg)
+
+
+def get_inject_target_mode() -> str:
+    mode = str(load_config().get("inject_target_mode") or "dynamic").lower().strip()
+    return mode if mode in {"dynamic", "pinned"} else "dynamic"
+
+
+def set_inject_target_mode(mode: str) -> None:
+    normalized = str(mode or "dynamic").lower().strip()
+    if normalized not in {"dynamic", "pinned"}:
+        normalized = "dynamic"
+    cfg = load_config()
+    cfg["inject_target_mode"] = normalized
+    save_config(cfg)
+
+
+def get_inject_pinned_hwnd() -> int | None:
+    raw = load_config().get("inject_pinned_hwnd")
+    if raw is None:
+        return None
+    try:
+        hwnd = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return hwnd if hwnd > 0 else None
+
+
+def set_inject_pinned_hwnd(hwnd: int | None) -> None:
+    cfg = load_config()
+    if hwnd is None or int(hwnd) <= 0:
+        cfg["inject_pinned_hwnd"] = None
+    else:
+        cfg["inject_pinned_hwnd"] = int(hwnd)
     save_config(cfg)
 
 

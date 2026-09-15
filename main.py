@@ -28,7 +28,6 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 from PyQt6.QtCore import QTimer  # noqa: E402
-from PyQt6.QtGui import QIcon, QImage, QPixmap  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from brand import APP_NAME, APP_VERSION, TRAY_TOOLTIP  # noqa: E402
@@ -40,8 +39,9 @@ from config import (  # noqa: E402
     has_api_key,
 )
 from hotkey_service import GlobalHotkeyService  # noqa: E402
+from icons import app_icon, make_tray_icon_image  # noqa: E402
 from log_config import setup_logging  # noqa: E402
-from popup import controller  # noqa: E402
+from popup import init_controller  # noqa: E402
 from settings_ui import SettingsDialog  # noqa: E402
 from startup import (  # noqa: E402
     apply_start_with_windows_from_config,
@@ -55,33 +55,50 @@ log = logging.getLogger(__name__)
 # Shared refs for clean shutdown (set during startup)
 _tray_icon: dict[str, Any] = {"icon": None}
 _hotkey_service: GlobalHotkeyService | None = None
+_app_controller: Any | None = None
 
 
-def make_tray_icon_image():
-    """Create a simple tray icon with Pillow (no external asset required)."""
-    from PIL import Image, ImageDraw
-
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    # Dark rounded square with coral spark accent
-    draw.rounded_rectangle((4, 4, size - 4, size - 4), radius=14, fill=(20, 20, 22, 255))
-    draw.ellipse((22, 20, 42, 40), fill=(240, 128, 96, 230))
-    draw.ellipse((30, 34, 44, 48), fill=(240, 128, 96, 140))
-    return img
+def _global_hotkey_bindings() -> dict[str, Any]:
+    if _app_controller is None:
+        raise RuntimeError("Application controller is not initialized")
+    return {
+        get_hotkey(): _app_controller.toggle_from_hotkey,
+        get_hotkey_collapse(): _app_controller.toggle_collapse_global_from_hotkey,
+    }
 
 
-def app_icon() -> QIcon:
-    """Shared window/tray icon so Qt never falls back to the framework logo."""
-    img = make_tray_icon_image()
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    data = img.tobytes("raw", "RGBA")
-    qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
-    return QIcon(QPixmap.fromImage(qimg))
+def _configure_frozen_runtime() -> None:
+    """Ensure Qt can find bundled plugins when running as Opti.exe."""
+    if not getattr(sys, "frozen", False):
+        return
+    import os
+
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return
+    for sub in (
+        os.path.join("PyQt6", "Qt6", "plugins"),
+        os.path.join("PyQt6", "Qt", "plugins"),
+    ):
+        plugin_path = os.path.join(base, sub)
+        if os.path.isdir(plugin_path):
+            os.environ.setdefault("QT_PLUGIN_PATH", plugin_path)
+            break
 
 
-def start_tray(on_quit, icon_holder: dict[str, Any]) -> None:
+def _install_excepthook() -> None:
+    """Log uncaught exceptions (console=False EXE has no stderr window)."""
+
+    def _hook(exc_type, exc, tb) -> None:  # noqa: ANN001
+        logging.getLogger(__name__).exception(
+            "Unhandled exception",
+            exc_info=(exc_type, exc, tb),
+        )
+
+    sys.excepthook = _hook
+
+
+def start_tray(on_quit, icon_holder: dict[str, Any], controller) -> None:
     """Run pystray icon in a daemon thread."""
     import pystray
     from pystray import MenuItem as Item
@@ -135,13 +152,6 @@ def start_tray(on_quit, icon_holder: dict[str, Any]) -> None:
     log.info("Tray icon run loop exited")
 
 
-def _global_hotkey_bindings() -> dict[str, Any]:
-    return {
-        get_hotkey(): controller.toggle_from_hotkey,
-        get_hotkey_collapse(): controller.toggle_collapse_global_from_hotkey,
-    }
-
-
 def reload_global_hotkey() -> None:
     """Re-read config and restart the pynput listener (no app restart)."""
     global _hotkey_service
@@ -172,12 +182,19 @@ def stop_tray_icon() -> None:
 
 
 def main() -> None:
+    global _hotkey_service, _app_controller
+    _configure_frozen_runtime()
     setup_logging()
+    _install_excepthook()
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setWindowIcon(app_icon())
+
+    controller = init_controller()
+    _app_controller = controller
 
     apply_start_with_windows_from_config()
 
@@ -185,7 +202,6 @@ def main() -> None:
     if not has_api_key():
         SettingsDialog.run_if_needed()
 
-    global _hotkey_service
     quit_flag = {"done": False}
     force_exit_timer: QTimer | None = None
 
@@ -209,6 +225,14 @@ def main() -> None:
             return
         quit_flag["done"] = True
         log.info("Shutdown: begin")
+
+        # Close modal dialogs (history, settings) so nested exec() returns.
+        from PyQt6.QtWidgets import QDialog
+
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, QDialog) and widget.isVisible():
+                log.info("Closing open dialog: %s", widget.__class__.__name__)
+                widget.close()
 
         try:
             if controller.window is not None:
@@ -245,10 +269,15 @@ def main() -> None:
     app.screenAdded.connect(lambda _screen: controller.validate_window_position())
     app.screenRemoved.connect(lambda _screen: controller.validate_window_position())
 
-    # Tray (daemon thread)
+    # Build the popup on the main thread before background services start handling input.
+    log.info("Creating popup window")
+    controller.create_window()
+    log.info("Popup window ready")
+
+    # Tray (daemon thread) — starts after window exists so menu actions can run immediately.
     tray_thread = threading.Thread(
         target=start_tray,
-        args=(request_quit, _tray_icon),
+        args=(request_quit, _tray_icon, controller),
         name="OptiTray",
         daemon=True,
     )
@@ -258,15 +287,13 @@ def main() -> None:
     _hotkey_service = GlobalHotkeyService()
     _hotkey_service.start(_global_hotkey_bindings())
 
-    # Create popup and run Qt event loop on the main thread (required on Windows)
-    controller.create_window()
-
     if get_check_updates_on_launch():
         log.debug("Update check on launch is enabled (stub — not implemented)")
 
     if not get_start_minimized_to_tray():
         controller.show_expanded(capture_inject_target=False)
 
+    log.info("Entering Qt event loop")
     sys.exit(app.exec())
 
 

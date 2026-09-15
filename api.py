@@ -1,5 +1,5 @@
 """
-Gemini / Groq / OpenRouter / Anthropic API wrapper for Opti.
+Gemini / Groq / OpenRouter / Anthropic / OpenAI API wrapper for Opti.
 
 Provider is selected via config.json "provider". The API key stays in Python
 only — never exposed to the popup UI or external scripts.
@@ -14,12 +14,19 @@ import time
 from typing import Callable, Optional
 
 from brand import APP_NAME, GITHUB_URL
-from config import get_active_model, get_api_key, get_provider
+from config import (
+    get_active_model,
+    get_api_key,
+    get_effective_transform,
+    get_effective_transform_preset,
+    get_provider,
+)
 from projects import get_active_project, get_include_project_context_in_private, touch_project_last_used
-from prompt import SYSTEM_PROMPT, build_system_prompt
+from prompt import SYSTEM_PROMPT, build_system_prompt, normalize_transform
 
 # Re-export so existing imports of api.SYSTEM_PROMPT keep working
 __all__ = [
+    "is_rate_limit_error",
     "is_retryable_error",
     "optimize_prompt",
     "optimize_prompt_with_retry",
@@ -61,6 +68,21 @@ _RETRYABLE_MESSAGE_PATTERNS = (
 _MAX_RETRIES_EXCEEDED_MESSAGE = (
     "The API is temporarily busy. Please wait a moment and try again."
 )
+
+_RATE_LIMIT_MESSAGE_PATTERNS = _RETRYABLE_MESSAGE_PATTERNS + (
+    r"temporarily busy",
+)
+
+
+def is_rate_limit_error(message: str) -> bool:
+    """Return True when an error looks like provider rate limiting / overload."""
+    text = (message or "").strip()
+    if not text:
+        return False
+    if text == _MAX_RETRIES_EXCEEDED_MESSAGE:
+        return True
+    lower = text.lower()
+    return any(re.search(pattern, lower) for pattern in _RATE_LIMIT_MESSAGE_PATTERNS)
 
 
 def is_retryable_error(exc: BaseException) -> bool:
@@ -139,13 +161,26 @@ def _retry_delay_seconds(exc: BaseException, attempt: int) -> float:
     return capped + jitter
 
 
-def resolve_system_prompt(*, private_mode: bool = False) -> str:
+def resolve_system_prompt(
+    *,
+    private_mode: bool = False,
+    transform: str | None = None,
+    transform_preset: str | None = None,
+) -> str:
     """Build the system prompt, applying active project context when appropriate."""
     project = get_active_project()
+    mode = normalize_transform(transform) if transform is not None else get_effective_transform()
+    preset = (
+        str(transform_preset or "").strip()
+        if transform_preset is not None
+        else get_effective_transform_preset()
+    )
     return build_system_prompt(
         project,
         include_in_private=get_include_project_context_in_private(),
         private_mode=private_mode,
+        transform=mode,
+        transform_preset=preset,
     )
 
 
@@ -154,6 +189,8 @@ def optimize_prompt_with_retry(
     model: Optional[str] = None,
     *,
     private_mode: bool = False,
+    transform: str | None = None,
+    transform_preset: str | None = None,
     on_retry: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> str:
@@ -166,7 +203,13 @@ def optimize_prompt_with_retry(
         if should_cancel and should_cancel():
             raise RuntimeError("Cancelled")
         try:
-            return optimize_prompt(rough_prompt, model=model, private_mode=private_mode)
+            return optimize_prompt(
+                rough_prompt,
+                model=model,
+                private_mode=private_mode,
+                transform=transform,
+                transform_preset=transform_preset,
+            )
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if should_cancel and should_cancel():
@@ -205,9 +248,11 @@ def optimize_prompt(
     model: Optional[str] = None,
     *,
     private_mode: bool = False,
+    transform: str | None = None,
+    transform_preset: str | None = None,
 ) -> str:
     """
-    Rewrite a rough prompt using the configured provider.
+    Transform input text using the configured provider and transform mode.
 
     Raises ValueError for empty input / missing key, or RuntimeError for API failures.
     """
@@ -223,7 +268,11 @@ def optimize_prompt(
 
     provider = get_provider()
     model_id = model or get_active_model()
-    system_prompt = resolve_system_prompt(private_mode=private_mode)
+    system_prompt = resolve_system_prompt(
+        private_mode=private_mode,
+        transform=transform,
+        transform_preset=transform_preset,
+    )
 
     active = get_active_project()
     if active and not (private_mode and not get_include_project_context_in_private()):
@@ -233,11 +282,11 @@ def optimize_prompt(
         return _call_gemini(api_key, model_id, text, system_prompt)
     if provider == "anthropic":
         return _call_anthropic(api_key, model_id, text, system_prompt)
-    if provider in ("groq", "openrouter"):
+    if provider in ("groq", "openrouter", "openai"):
         return _call_openai_compatible(provider, api_key, model_id, text, system_prompt)
 
     raise ValueError(
-        f"Unknown provider '{provider}'. Use gemini, groq, openrouter, or anthropic."
+        f"Unknown provider '{provider}'. Use gemini, groq, openrouter, anthropic, or openai."
     )
 
 
@@ -332,6 +381,10 @@ _OPENAI_COMPAT = {
             "HTTP-Referer": GITHUB_URL,
             "X-Title": APP_NAME,
         },
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "label": "OpenAI",
     },
 }
 

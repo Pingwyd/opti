@@ -229,9 +229,21 @@ def _force_foreground(hwnd: int) -> bool:
                 win32gui.GetForegroundWindow(),
             )
         return ok
-    except Exception:
-        log.warning("_force_foreground failed for hwnd=%s", hwnd, exc_info=True)
+    except Exception as exc:
+        err_name = type(exc).__name__
+        if err_name in {"error", "pywintypes_error"} or "pywintypes" in str(type(exc)):
+            log.warning(
+                "inject focus blocked (elevation mismatch?): hwnd=%s err=%s",
+                hwnd,
+                exc,
+            )
+        else:
+            log.warning("_force_foreground failed for hwnd=%s", hwnd, exc_info=True)
         return False
+
+
+class FocusRestoreError(RuntimeError):
+    """Target window could not be brought to the foreground (often UAC elevation)."""
 
 
 def _send_ctrl_v() -> None:
@@ -275,6 +287,12 @@ def inject_via_paste(hwnd: int, text: str) -> tuple[bool, str]:
             fg_after,
             focused,
         )
+        if not focused and fg_after != hwnd:
+            return (
+                False,
+                "Could not focus target window. It may be elevated (Run as administrator) "
+                "or on another virtual desktop. Use clipboard instead.",
+            )
 
         try:
             pyperclip.copy(text)

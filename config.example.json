@@ -1,11 +1,18 @@
 {
   "provider": "gemini",
-  "api_key": "",
   "hotkey": "Ctrl+Shift+Space",
   "hotkey_collapse": "Ctrl+Alt+M",
   "model": "gemini-3.5-flash",
   "model_fast": "gemini-3.1-flash-lite",
   "mode": "thorough",
+  "transform": "optimize",
+  "transform_preset": "",
+  "prefill_from_clipboard": false,
   "history_limit": 50,
-  "start_with_windows": false
+  "start_with_windows": false,
+  "voice_enabled": false,
+  "voice_recording_mode": "push_to_talk",
+  "voice_model_size": "base",
+  "voice_toggle_max_seconds": 60,
+  "voice_ptt_shortcut": "Ctrl+Space"
 }
