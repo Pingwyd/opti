@@ -296,6 +296,10 @@ def test_settings_voice_toggle_immediate_apply(qapp, isolated_config):
     assert config.load_config()["voice_enabled"] is True
     dlg._voice_enabled_toggle.setChecked(False)
     qapp.processEvents()
+    from PyQt6.QtTest import QTest
+
+    QTest.qWait(100)
+    qapp.processEvents()
     assert config.load_config()["voice_enabled"] is False
     dlg.close()
 
