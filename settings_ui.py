@@ -13,12 +13,13 @@ import logging
 import threading
 from typing import Any, Callable
 
-from PyQt6.QtCore import QObject, QPoint, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFontMetrics, QIcon, QMouseEvent
+from PyQt6.QtCore import QObject, QPoint, QUrl, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QDesktopServices, QFontMetrics, QIcon, QMouseEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -27,6 +28,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizeGrip,
     QSizePolicy,
@@ -68,7 +70,17 @@ from config import (
 )
 from history import DEFAULT_SENSITIVE_KEYWORDS, counts_by_project_name
 from hotkey_service import parse_hotkey_to_pynput
-from projects import create_project, delete_project, get_project, list_projects, update_project
+from backup import ImportMode, backup_summary, export_to_path, import_from_path, load_backup_from_path
+from paths import get_data_dir
+from projects import (
+    PROJECT_TYPES,
+    create_project,
+    delete_project,
+    get_project,
+    list_projects,
+    parse_tech_stack_input,
+    update_project,
+)
 from prompt import VALID_TRANSFORMS, normalize_transform
 from transform_ui import TRANSFORM_MENU_LABELS
 from vault import env_key_hint
@@ -118,6 +130,40 @@ HISTORY_LIMIT_MAX = 5000
 PRIVACY_HISTORY_MIN = 10
 PRIVACY_HISTORY_MAX = 500
 PRIVACY_HISTORY_STEP = 10
+
+PROJECT_TEXT_MIN_HEIGHT = 72
+PROJECT_TEXT_MAX_HEIGHT = 140
+
+
+def project_draft_from_record(project: dict[str, Any]) -> dict[str, str]:
+    """Normalized editable fields for a project (for dirty comparison)."""
+    tech = project.get("tech_stack") or []
+    tech_text = ", ".join(str(t).strip() for t in tech if str(t).strip())
+    return {
+        "name": str(project.get("name") or ""),
+        "project_type": str(project.get("project_type") or ""),
+        "tech_stack_text": tech_text,
+        "conventions": str(project.get("conventions") or ""),
+        "notes": str(project.get("notes") or ""),
+        "inject_process": str(project.get("inject_process") or ""),
+        "default_transform": normalize_transform(project.get("default_transform")),
+    }
+
+
+def draft_to_update_kwargs(draft: dict[str, str]) -> dict[str, Any]:
+    """Map form draft to update_project keyword arguments."""
+    ptype = str(draft.get("project_type") or "").strip()
+    if ptype not in PROJECT_TYPES:
+        ptype = ""
+    return {
+        "name": str(draft.get("name") or "").strip(),
+        "project_type": ptype,
+        "tech_stack": parse_tech_stack_input(str(draft.get("tech_stack_text") or "")),
+        "conventions": str(draft.get("conventions") or ""),
+        "notes": str(draft.get("notes") or ""),
+        "inject_process": str(draft.get("inject_process") or "").strip(),
+        "default_transform": str(draft.get("default_transform") or "optimize"),
+    }
 
 _write_lock = threading.Lock()
 
@@ -705,6 +751,7 @@ class SettingsDialog(QDialog):
         ("shortcuts", "Shortcuts", "shortcuts"),
         ("startup", "Startup", "startup"),
         ("projects", "Projects", "projects"),
+        ("data", "Data", "data"),
     ]
 
     def __init__(
@@ -728,9 +775,13 @@ class SettingsDialog(QDialog):
 
         self._selected_project_id: str | None = None
         self._loading_project_detail = False
-        self._pending_project_fields: dict[str, str] = {}
+        self._project_saved_snapshot: dict[str, str] = {}
         self._pending_new_project = False
         self._pending_delete_project = False
+        self._nav_guard = False
+        self._project_list_guard = False
+        self._footer_hint: QLabel | None = None
+        self._application_quitting = False
         self._last_good_shortcuts: dict[str, str] = {}
         self._shortcut_caps: dict[str, KeyCapRow] = {}
         self._shortcut_rows: dict[str, SettingRow] = {}
@@ -749,10 +800,6 @@ class SettingsDialog(QDialog):
         self._geometry_timer = QTimer(self)
         self._geometry_timer.setSingleShot(True)
         self._geometry_timer.timeout.connect(self._persist_geometry)
-
-        self._project_save_timer = QTimer(self)
-        self._project_save_timer.setSingleShot(True)
-        self._project_save_timer.timeout.connect(self._flush_project_save)
 
         self._build_ui()
         self.setStyleSheet(settings_stylesheet())
@@ -776,12 +823,27 @@ class SettingsDialog(QDialog):
 
     # -- window chrome -----------------------------------------------------
 
-    def closeEvent(self, event) -> None:  # noqa: ANN001
+    def prepare_for_application_quit(self) -> None:
+        """Skip unsaved prompts and stop background writes (app shutdown)."""
+        self._application_quitting = True
         self._writer.shutdown()
-        if self._project_save_timer.isActive():
-            self._project_save_timer.stop()
-            self._flush_project_save()
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        if self._application_quitting:
+            super().closeEvent(event)
+            return
+        if not self._try_leave_projects_pane():
+            event.ignore()
+            return
+        self._writer.shutdown()
         super().closeEvent(event)
+
+    def close(self) -> bool:  # noqa: ANN001
+        if self._application_quitting:
+            return super().close()
+        if not self._try_leave_projects_pane():
+            return False
+        return super().close()
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
@@ -924,10 +986,10 @@ class SettingsDialog(QDialog):
         footer = QHBoxLayout()
         footer.setContentsMargins(22, 12, 16, 14)
         footer.setSpacing(8)
-        hint = QLabel("Changes apply immediately", shell)
-        hint.setObjectName("footerHint")
-        hint.setFont(settings_font(FONT_CAPTION))
-        footer.addWidget(hint)
+        self._footer_hint = QLabel("Changes apply immediately", shell)
+        self._footer_hint.setObjectName("footerHint")
+        self._footer_hint.setFont(settings_font(FONT_CAPTION))
+        footer.addWidget(self._footer_hint)
         footer.addStretch(1)
         close_btn = QPushButton("Close", shell)
         close_btn.setObjectName("footerCloseBtn")
@@ -944,6 +1006,7 @@ class SettingsDialog(QDialog):
             self._build_shortcuts_pane(),
             self._build_startup_pane(),
             self._build_projects_pane(),
+            self._build_data_pane(),
         ]
         for (_pane_id, label, icon_kind), pane_widget in zip(self.PANE_DEFS, panes):
             item = QListWidgetItem(render_nav_pixmap(icon_kind), label)
@@ -1581,12 +1644,26 @@ class SettingsDialog(QDialog):
         edit.document().documentLayout().documentSizeChanged.connect(_resize)
         _resize()
 
-    def _build_projects_pane(self) -> QScrollArea:
-        scroll, _title_outer = self._build_pane(
-            "Projects", "Context injected into every prompt for that project"
+    def _build_projects_pane(self) -> QWidget:
+        wrap = QWidget()
+        wrap.setObjectName("settingsPane")
+        outer = QVBoxLayout(wrap)
+        outer.setContentsMargins(22, 20, 22, 20)
+        outer.setSpacing(4)
+
+        title_label = QLabel("Projects", wrap)
+        title_label.setObjectName("paneTitle")
+        title_label.setFont(settings_font(FONT_TITLE, WEIGHT_MEDIUM))
+        outer.addWidget(title_label)
+
+        subtitle_label = QLabel(
+            "Structured fields are injected into prompts; Notes are supplementary."
         )
-        content = scroll.widget()
-        outer = content.layout()
+        subtitle_label.setObjectName("paneSubtitle")
+        subtitle_label.setFont(settings_font(FONT_BODY))
+        subtitle_label.setWordWrap(True)
+        outer.addWidget(subtitle_label)
+        outer.addSpacing(10)
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -1596,18 +1673,7 @@ class SettingsDialog(QDialog):
         list_wrap.setFixedWidth(180)
         list_col = QVBoxLayout(list_wrap)
         list_col.setContentsMargins(0, 0, 0, 0)
-        list_col.setSpacing(0)
-
-        self._projects_list = QListWidget()
-        self._projects_list.setObjectName("projectsNavList")
-        self._projects_list.setFont(settings_font(FONT_SMALL))
-        self._projects_list.currentItemChanged.connect(self._on_project_selected)
-        list_col.addWidget(self._projects_list, 1)
-
-        divider = QFrame()
-        divider.setObjectName("rowDivider")
-        divider.setFixedHeight(1)
-        list_col.addWidget(divider)
+        list_col.setSpacing(8)
 
         new_btn = QPushButton("+ New project")
         new_btn.setObjectName("linkAction")
@@ -1617,19 +1683,48 @@ class SettingsDialog(QDialog):
         new_btn.clicked.connect(self._on_new_project)
         list_col.addWidget(new_btn)
 
+        divider = QFrame()
+        divider.setObjectName("rowDivider")
+        divider.setFixedHeight(1)
+        list_col.addWidget(divider)
+
+        self._projects_list = QListWidget()
+        self._projects_list.setObjectName("projectsNavList")
+        self._projects_list.setFont(settings_font(FONT_SMALL))
+        self._projects_list.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self._projects_list.currentItemChanged.connect(self._on_project_selected)
+        list_col.addWidget(self._projects_list, 1)
+
         body.addWidget(list_wrap, 0)
+
+        detail_scroll = QScrollArea()
+        detail_scroll.setObjectName("settingsPaneScroll")
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         detail_wrap = QWidget()
         detail_layout = QVBoxLayout(detail_wrap)
-        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setContentsMargins(0, 0, 6, 0)
         detail_layout.setSpacing(8)
 
         header_row = QHBoxLayout()
-        self._project_name_label = QLabel("")
-        self._project_name_label.setObjectName("projectDetailName")
-        self._project_name_label.setFont(settings_font(FONT_SECTION, WEIGHT_MEDIUM))
-        header_row.addWidget(self._project_name_label)
+        self._project_save_btn = QPushButton("Save")
+        self._project_save_btn.setObjectName("projectSaveBtn")
+        self._project_save_btn.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        self._project_save_btn.setEnabled(False)
+        self._project_save_btn.clicked.connect(self._on_project_save_clicked)
         header_row.addStretch(1)
+        header_row.addWidget(self._project_save_btn)
+        self._project_cancel_btn = QPushButton("Cancel")
+        self._project_cancel_btn.setObjectName("linkAction")
+        self._project_cancel_btn.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        self._project_cancel_btn.setFlat(True)
+        self._project_cancel_btn.setEnabled(False)
+        self._project_cancel_btn.clicked.connect(self._on_project_cancel_clicked)
+        header_row.addWidget(self._project_cancel_btn)
         self._project_delete_btn = QPushButton("Delete")
         self._project_delete_btn.setObjectName("dangerLinkAction")
         self._project_delete_btn.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
@@ -1642,48 +1737,80 @@ class SettingsDialog(QDialog):
         self._project_saved_label.setObjectName("projectDetailSaved")
         self._project_saved_label.setFont(settings_font(FONT_CAPTION))
         detail_layout.addWidget(self._project_saved_label)
-        detail_layout.addSpacing(4)
 
-        context_label = QLabel("Context")
-        context_label.setObjectName("fieldCaption")
-        context_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
-        detail_layout.addWidget(context_label)
+        name_label = QLabel("Project name")
+        name_label.setObjectName("fieldCaption")
+        name_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        detail_layout.addWidget(name_label)
+        self._project_name_edit = QLineEdit()
+        self._project_name_edit.setFont(settings_font(FONT_BODY))
+        self._project_name_edit.textChanged.connect(self._on_project_form_changed)
+        detail_layout.addWidget(self._project_name_edit)
 
-        self._project_context_edit = QTextEdit()
-        self._project_context_edit.setFont(settings_font(FONT_BODY))
-        self._project_context_edit.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self._project_context_edit.textChanged.connect(
-            lambda: self._on_project_text_changed("conventions", self._project_context_edit)
-        )
-        detail_layout.addWidget(self._project_context_edit)
+        type_label = QLabel("Project type")
+        type_label.setObjectName("fieldCaption")
+        type_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        detail_layout.addWidget(type_label)
+        self._project_type_combo = QComboBox()
+        self._project_type_combo.setFont(settings_font(FONT_BODY))
+        self._project_type_combo.addItem("(None)", "")
+        for ptype in PROJECT_TYPES:
+            if ptype:
+                self._project_type_combo.addItem(ptype, ptype)
+        self._project_type_combo.currentIndexChanged.connect(self._on_project_form_changed)
+        detail_layout.addWidget(self._project_type_combo)
+
+        stack_label = QLabel("Tech stack")
+        stack_label.setObjectName("fieldCaption")
+        stack_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        detail_layout.addWidget(stack_label)
+        self._project_tech_stack_edit = QLineEdit()
+        self._project_tech_stack_edit.setFont(settings_font(FONT_BODY))
+        self._project_tech_stack_edit.setPlaceholderText("e.g. Python, PyQt6, React")
+        self._project_tech_stack_edit.textChanged.connect(self._on_project_form_changed)
+        detail_layout.addWidget(self._project_tech_stack_edit)
+        stack_help = QLabel("Comma-separated — included as Tech stack in the prompt.")
+        stack_help.setObjectName("settingRowHelper")
+        stack_help.setFont(settings_font(FONT_CAPTION))
+        stack_help.setWordWrap(True)
+        detail_layout.addWidget(stack_help)
+
+        conv_label = QLabel("Conventions")
+        conv_label.setObjectName("fieldCaption")
+        conv_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        detail_layout.addWidget(conv_label)
+        self._project_conventions_edit = QTextEdit()
+        self._project_conventions_edit.setFont(settings_font(FONT_BODY))
+        self._project_conventions_edit.setMinimumHeight(PROJECT_TEXT_MIN_HEIGHT)
+        self._project_conventions_edit.setMaximumHeight(PROJECT_TEXT_MAX_HEIGHT)
+        self._project_conventions_edit.textChanged.connect(self._on_project_form_changed)
+        detail_layout.addWidget(self._project_conventions_edit)
+        conv_help = QLabel("Coding style, architecture rules, and constraints the model should follow.")
+        conv_help.setObjectName("settingRowHelper")
+        conv_help.setFont(settings_font(FONT_CAPTION))
+        conv_help.setWordWrap(True)
+        detail_layout.addWidget(conv_help)
 
         notes_label = QLabel("Notes")
         notes_label.setObjectName("fieldCaption")
         notes_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
         detail_layout.addWidget(notes_label)
-
         self._project_notes_edit = QTextEdit()
         self._project_notes_edit.setFont(settings_font(FONT_BODY))
-        self._project_notes_edit.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self._project_notes_edit.textChanged.connect(
-            lambda: self._on_project_text_changed("notes", self._project_notes_edit)
-        )
+        self._project_notes_edit.setMinimumHeight(PROJECT_TEXT_MIN_HEIGHT)
+        self._project_notes_edit.setMaximumHeight(PROJECT_TEXT_MAX_HEIGHT)
+        self._project_notes_edit.textChanged.connect(self._on_project_form_changed)
         detail_layout.addWidget(self._project_notes_edit)
-
-        inject_label = QLabel("Inject target process")
-        inject_label.setObjectName("fieldCaption")
-        inject_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
-        detail_layout.addWidget(inject_label)
+        notes_help = QLabel("Extra reminders — not duplicated in Conventions.")
+        notes_help.setObjectName("settingRowHelper")
+        notes_help.setFont(settings_font(FONT_CAPTION))
+        notes_help.setWordWrap(True)
+        detail_layout.addWidget(notes_help)
 
         transform_label = QLabel("Default transform")
         transform_label.setObjectName("fieldCaption")
         transform_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
         detail_layout.addWidget(transform_label)
-
         self._project_default_transform = QComboBox()
         self._project_default_transform.setObjectName("projectDefaultTransform")
         self._project_default_transform.setFont(settings_font(FONT_BODY))
@@ -1691,42 +1818,73 @@ class SettingsDialog(QDialog):
             self._project_default_transform.addItem(
                 TRANSFORM_MENU_LABELS[transform_id], transform_id
             )
-        self._project_default_transform.currentIndexChanged.connect(
-            self._on_project_default_transform_changed
-        )
+        self._project_default_transform.currentIndexChanged.connect(self._on_project_form_changed)
         detail_layout.addWidget(self._project_default_transform)
 
-        transform_help = QLabel(
-            "When this project is active, the pill uses this transform by default."
-        )
-        transform_help.setObjectName("settingRowHelper")
-        transform_help.setFont(settings_font(FONT_CAPTION))
-        transform_help.setWordWrap(True)
-        detail_layout.addWidget(transform_help)
-
+        inject_label = QLabel("Inject target process")
+        inject_label.setObjectName("fieldCaption")
+        inject_label.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        detail_layout.addWidget(inject_label)
         self._project_inject_process = QLineEdit()
         self._project_inject_process.setObjectName("projectInjectProcess")
         self._project_inject_process.setFont(settings_font(FONT_BODY))
-        self._project_inject_process.setPlaceholderText("e.g. Code.exe — leave empty for pill selector")
-        self._project_inject_process.textChanged.connect(self._on_project_inject_process_changed)
+        self._project_inject_process.setPlaceholderText(
+            "e.g. Code.exe — leave empty for pill selector"
+        )
+        self._project_inject_process.textChanged.connect(self._on_project_form_changed)
         detail_layout.addWidget(self._project_inject_process)
 
-        inject_help = QLabel(
-            "When set, optimizations for this project always inject into that app "
-            "(first open window if several match)."
-        )
-        inject_help.setObjectName("settingRowHelper")
-        inject_help.setFont(settings_font(FONT_CAPTION))
-        inject_help.setWordWrap(True)
-        detail_layout.addWidget(inject_help)
-
-        body.addWidget(detail_wrap, 1)
+        detail_layout.addStretch(1)
+        detail_scroll.setWidget(detail_wrap)
+        body.addWidget(detail_scroll, 1)
         outer.addLayout(body, 1)
 
-        self._auto_grow_text_edit(self._project_context_edit)
-        self._auto_grow_text_edit(self._project_notes_edit)
-
         self._reload_projects_list()
+        return wrap
+
+    def _build_data_pane(self) -> QScrollArea:
+        scroll, outer = self._build_pane(
+            "Data",
+            "Back up settings, projects, and API keys — or move from a dev install to the installed app.",
+        )
+        group = self._new_group(outer)
+
+        data_dir = str(get_data_dir())
+        folder_row = SettingRow("Data folder", data_dir)
+        open_btn = QPushButton("Open folder")
+        open_btn.setObjectName("linkAction")
+        open_btn.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        open_btn.setFlat(True)
+        open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_btn.clicked.connect(self._on_open_data_folder)
+        folder_row.set_control(open_btn)
+        group.addWidget(folder_row)
+
+        export_row = SettingRow(
+            "Export backup",
+            "Saves settings, projects, and API keys to a file (keys are stored in plaintext).",
+        )
+        export_btn = QPushButton("Export…")
+        export_btn.setObjectName("linkAction")
+        export_btn.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        export_btn.setFlat(True)
+        export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        export_btn.clicked.connect(self._on_export_backup)
+        export_row.set_control(export_btn)
+        group.addWidget(export_row)
+
+        import_row = SettingRow("Import backup", "Restore from a backup file.")
+        import_btn = QPushButton("Import…")
+        import_btn.setObjectName("linkAction")
+        import_btn.setFont(settings_font(FONT_CAPTION, WEIGHT_MEDIUM))
+        import_btn.setFlat(True)
+        import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        import_btn.clicked.connect(self._on_import_backup)
+        import_row.set_control(import_btn)
+        group.addWidget(import_row)
+
+        self._finalize_rows(group)
+        outer.addStretch(1)
         return scroll
 
     def _reload_projects_list(self, *, select_id: str | None = None) -> None:
@@ -1756,9 +1914,145 @@ class SettingsDialog(QDialog):
             self._load_project_detail(None)
         self._sync_project_list_selection()
 
+    def _pane_row(self, pane_id: str) -> int:
+        for index, (pid, _, _) in enumerate(self.PANE_DEFS):
+            if pid == pane_id:
+                return index
+        return -1
+
+    def _projects_pane_active(self) -> bool:
+        return self._stack.currentIndex() == self._pane_row("projects")
+
+    def _read_project_form(self) -> dict[str, str]:
+        return {
+            "name": self._project_name_edit.text(),
+            "project_type": str(self._project_type_combo.currentData() or ""),
+            "tech_stack_text": self._project_tech_stack_edit.text(),
+            "conventions": self._project_conventions_edit.toPlainText(),
+            "notes": self._project_notes_edit.toPlainText(),
+            "inject_process": self._project_inject_process.text(),
+            "default_transform": str(self._project_default_transform.currentData() or "optimize"),
+        }
+
+    def _apply_project_draft_to_form(self, draft: dict[str, str]) -> None:
+        self._loading_project_detail = True
+        try:
+            self._project_name_edit.setText(draft.get("name", ""))
+            ptype = str(draft.get("project_type") or "")
+            type_index = self._project_type_combo.findData(ptype)
+            self._project_type_combo.setCurrentIndex(type_index if type_index >= 0 else 0)
+            self._project_tech_stack_edit.setText(draft.get("tech_stack_text", ""))
+            self._project_conventions_edit.setPlainText(draft.get("conventions", ""))
+            self._project_notes_edit.setPlainText(draft.get("notes", ""))
+            self._project_inject_process.setText(draft.get("inject_process", ""))
+            transform = normalize_transform(draft.get("default_transform"))
+            transform_index = self._project_default_transform.findData(transform)
+            self._project_default_transform.setCurrentIndex(
+                transform_index if transform_index >= 0 else 0
+            )
+        finally:
+            self._loading_project_detail = False
+
+    def _project_is_dirty(self) -> bool:
+        if not self._selected_project_id:
+            return False
+        return self._read_project_form() != self._project_saved_snapshot
+
+    def _update_project_dirty_ui(self) -> None:
+        dirty = self._project_is_dirty()
+        self._project_save_btn.setEnabled(dirty and bool(self._selected_project_id))
+        self._project_cancel_btn.setEnabled(dirty and bool(self._selected_project_id))
+        if dirty:
+            self._project_saved_label.setText("Unsaved changes")
+        elif self._selected_project_id:
+            project = get_project(self._selected_project_id)
+            if project:
+                self._project_saved_label.setText(
+                    format_relative_time(str(project.get("updated") or ""))
+                )
+        self._update_footer_hint()
+
+    def _update_footer_hint(self) -> None:
+        if self._footer_hint is None:
+            return
+        if self._projects_pane_active() and self._project_is_dirty():
+            self._footer_hint.setText("You have unsaved project changes")
+        else:
+            self._footer_hint.setText("Changes apply immediately")
+
+    def _save_current_project(self) -> bool:
+        project_id = self._selected_project_id
+        if not project_id:
+            return True
+        try:
+            update_project(project_id, **draft_to_update_kwargs(self._read_project_form()))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Could not save project", str(exc))
+            return False
+        self._project_saved_snapshot = self._read_project_form()
+        self._update_project_dirty_ui()
+        self._reload_projects_list(select_id=project_id)
+        if self._on_saved is not None:
+            self._on_saved()
+        return True
+
+    def _revert_project_form(self) -> None:
+        self._apply_project_draft_to_form(self._project_saved_snapshot)
+        self._update_project_dirty_ui()
+
+    def _confirm_discard_project_changes(self) -> bool:
+        if not self._project_is_dirty():
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Unsaved project changes")
+        box.setText("Save changes to this project before continuing?")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Save)
+        result = box.exec()
+        if result == QMessageBox.StandardButton.Save:
+            return self._save_current_project()
+        if result == QMessageBox.StandardButton.Discard:
+            self._revert_project_form()
+            return True
+        return False
+
+    def _try_leave_projects_pane(self) -> bool:
+        if self._application_quitting:
+            return True
+        if not self._project_is_dirty():
+            return True
+        return self._confirm_discard_project_changes()
+
+    def _on_project_save_clicked(self) -> None:
+        self._save_current_project()
+
+    def _on_project_cancel_clicked(self) -> None:
+        self._revert_project_form()
+
+    def _on_project_form_changed(self, *_args: Any) -> None:
+        if self._loading_project_detail or not self._selected_project_id:
+            return
+        self._update_project_dirty_ui()
+
     def _on_project_selected(
-        self, current: QListWidgetItem | None, _previous: QListWidgetItem | None
+        self, current: QListWidgetItem | None, previous: QListWidgetItem | None
     ) -> None:
+        if self._project_list_guard:
+            return
+        if previous is not None and self._project_is_dirty():
+            prev_row = self._projects_list.row(previous)
+            self._project_list_guard = True
+            if not self._confirm_discard_project_changes():
+                self._projects_list.setCurrentRow(prev_row)
+                self._project_list_guard = False
+                return
+            self._project_list_guard = False
+
         if current is None:
             self._selected_project_id = None
             self._load_project_detail(None)
@@ -1769,97 +2063,42 @@ class SettingsDialog(QDialog):
         self._load_project_detail(project_id)
 
     def _load_project_detail(self, project_id: str | None) -> None:
-        self._loading_project_detail = True
-        try:
-            if project_id is None:
-                self._project_name_label.setText("No projects yet")
-                self._project_saved_label.setText("")
-                self._project_context_edit.setPlainText("")
-                self._project_notes_edit.setPlainText("")
-                self._project_inject_process.clear()
-                self._project_default_transform.setCurrentIndex(0)
-                self._project_delete_btn.setEnabled(False)
-                self._project_context_edit.setEnabled(False)
-                self._project_notes_edit.setEnabled(False)
-                self._project_inject_process.setEnabled(False)
-                self._project_default_transform.setEnabled(False)
-                return
+        enabled = project_id is not None
+        for widget in (
+            self._project_name_edit,
+            self._project_type_combo,
+            self._project_tech_stack_edit,
+            self._project_conventions_edit,
+            self._project_notes_edit,
+            self._project_inject_process,
+            self._project_default_transform,
+        ):
+            widget.setEnabled(enabled)
+        self._project_delete_btn.setEnabled(enabled)
 
-            project = get_project(project_id)
-            if project is None:
-                return
-
-            self._project_context_edit.setEnabled(True)
-            self._project_notes_edit.setEnabled(True)
-            self._project_inject_process.setEnabled(True)
-            self._project_default_transform.setEnabled(True)
-            self._project_delete_btn.setEnabled(True)
-            self._project_name_label.setText(str(project.get("name") or "Project"))
-            self._project_saved_label.setText(
-                format_relative_time(str(project.get("updated") or ""))
+        if project_id is None:
+            self._project_saved_snapshot = {}
+            self._apply_project_draft_to_form(
+                {
+                    "name": "",
+                    "project_type": "",
+                    "tech_stack_text": "",
+                    "conventions": "",
+                    "notes": "",
+                    "inject_process": "",
+                    "default_transform": "optimize",
+                }
             )
-            self._project_context_edit.setPlainText(str(project.get("conventions") or ""))
-            self._project_notes_edit.setPlainText(str(project.get("notes") or ""))
-            self._project_inject_process.blockSignals(True)
-            self._project_inject_process.setText(str(project.get("inject_process") or ""))
-            self._project_inject_process.blockSignals(False)
-            transform = normalize_transform(project.get("default_transform"))
-            transform_index = self._project_default_transform.findData(transform)
-            self._project_default_transform.blockSignals(True)
-            self._project_default_transform.setCurrentIndex(
-                transform_index if transform_index >= 0 else 0
-            )
-            self._project_default_transform.blockSignals(False)
-        finally:
-            self._loading_project_detail = False
-
-    def _on_project_text_changed(self, field: str, edit: QTextEdit) -> None:
-        if self._loading_project_detail or not self._selected_project_id:
+            self._project_saved_label.setText("No projects yet — use + New project")
+            self._update_project_dirty_ui()
             return
-        self._pending_project_fields[field] = edit.toPlainText()
-        self._project_save_timer.start(400)
 
-    def _on_project_inject_process_changed(self, text: str) -> None:
-        if self._loading_project_detail or not self._selected_project_id:
-            return
-        self._pending_project_fields["inject_process"] = text.strip()
-        self._project_save_timer.start(400)
-
-    def _on_project_default_transform_changed(self, _index: int) -> None:
-        if self._loading_project_detail or not self._selected_project_id:
-            return
-        transform = str(self._project_default_transform.currentData() or "optimize")
-        self._pending_project_fields["default_transform"] = transform
-        self._project_save_timer.start(400)
-
-    def _flush_project_save(self) -> None:
-        project_id = self._selected_project_id
-        fields = self._pending_project_fields
-        self._pending_project_fields = {}
-        if not project_id or not fields:
-            return
-        self._writer.run_task(lambda: self._persist_project_fields(project_id, fields))
-
-    @staticmethod
-    def _persist_project_fields(project_id: str, fields: dict[str, str]) -> str | None:
         project = get_project(project_id)
         if project is None:
-            return None
-        kwargs = {
-            "name": project.get("name", ""),
-            "tech_stack": project.get("tech_stack", []),
-            "project_type": project.get("project_type", ""),
-            "conventions": project.get("conventions", ""),
-            "notes": project.get("notes", ""),
-            "inject_process": project.get("inject_process", ""),
-            "default_transform": project.get("default_transform", "optimize"),
-        }
-        kwargs.update(fields)
-        try:
-            update_project(project_id, **kwargs)
-        except ValueError:
-            return None
-        return "field_saved"
+            return
+        self._project_saved_snapshot = project_draft_from_record(project)
+        self._apply_project_draft_to_form(self._project_saved_snapshot)
+        self._update_project_dirty_ui()
 
     def _unique_new_project_name(self) -> str:
         existing = {str(p.get("name", "")).strip().lower() for p in list_projects()}
@@ -1872,6 +2111,8 @@ class SettingsDialog(QDialog):
         return f"{base} {n}"
 
     def _on_new_project(self) -> None:
+        if not self._confirm_discard_project_changes():
+            return
         name = self._unique_new_project_name()
         self._pending_new_project = True
         self._writer.run_task(lambda: create_project(name=name))
@@ -1882,10 +2123,13 @@ class SettingsDialog(QDialog):
             return
         project = get_project(project_id)
         name = str(project.get("name") or "this project") if project else "this project"
+        if self._project_is_dirty():
+            if not self._confirm_discard_project_changes():
+                return
         confirm = QMessageBox.question(
             self,
             "Delete project",
-            f'Delete "{name}"? This removes its context and notes, and cannot be undone.',
+            f'Delete "{name}"? This removes its saved fields and cannot be undone.',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1911,17 +2155,127 @@ class SettingsDialog(QDialog):
             self._pending_new_project = False
             if isinstance(result, str):
                 self._reload_projects_list(select_id=result)
-        elif self._selected_project_id:
-            self._project_saved_label.setText("Saved just now")
+        if self._on_saved is not None:
+            self._on_saved()
+
+    def _on_open_data_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_data_dir())))
+
+    def _on_export_backup(self) -> None:
+        confirm = QMessageBox.warning(
+            self,
+            "Export backup",
+            "The backup file will contain your API keys in plaintext.\n"
+            "Store it somewhere safe and do not share it.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Ok:
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Opti backup",
+            "Opti-backup.opti.json",
+            "Opti backup (*.opti.json);;JSON files (*.json)",
+        )
+        if not dest:
+            return
+        try:
+            export_to_path(dest)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Export complete", f"Backup saved to:\n{dest}")
+
+    def _on_import_backup(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Opti backup",
+            "",
+            "Opti backup (*.opti.json);;JSON files (*.json)",
+        )
+        if not path:
+            return
+        try:
+            doc = load_backup_from_path(path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid backup", str(exc))
+            return
+        summary = backup_summary(doc)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import backup")
+        layout = QVBoxLayout(dlg)
+        preview = QLabel(
+            f"From Opti {summary['app_version'] or '?'} "
+            f"({summary['exported_at'] or 'unknown date'})\n"
+            f"Projects: {summary['project_count']}\n"
+            f"API keys: {', '.join(summary['providers_with_keys']) or 'none'}"
+        )
+        preview.setWordWrap(True)
+        layout.addWidget(preview)
+        merge_radio = QRadioButton("Merge with current data")
+        merge_radio.setChecked(True)
+        replace_radio = QRadioButton("Replace settings and projects")
+        layout.addWidget(merge_radio)
+        layout.addWidget(replace_radio)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        ok_btn = QPushButton("Import")
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(ok_btn)
+        layout.addLayout(buttons)
+        cancel_btn.clicked.connect(dlg.reject)
+        ok_btn.clicked.connect(dlg.accept)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        mode = ImportMode.REPLACE if replace_radio.isChecked() else ImportMode.MERGE
+        if mode == ImportMode.REPLACE:
+            confirm = QMessageBox.warning(
+                self,
+                "Replace data",
+                "This will overwrite your current settings and projects "
+                "(API keys in the backup will be applied). Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            result = import_from_path(path, mode=mode)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Import failed", str(exc))
+            return
+        self._load_all()
+        self._reload_projects_list()
+        renamed = "\n".join(result.projects_renamed) if result.projects_renamed else ""
+        extra = f"\nRenamed projects:\n{renamed}" if renamed else ""
+        QMessageBox.information(
+            self,
+            "Import complete",
+            f"Updated {result.settings_keys_updated} settings keys, "
+            f"added/merged {result.projects_added} project(s), "
+            f"imported {result.vault_keys_imported} API key(s).{extra}",
+        )
         if self._on_saved is not None:
             self._on_saved()
 
     # -- misc ----------------------------------------------------------------
 
     def _on_nav_changed(self, row: int) -> None:
-        if row < 0:
+        if self._nav_guard or row < 0:
             return
+        projects_row = self._pane_row("projects")
+        if self._stack.currentIndex() == projects_row and row != projects_row:
+            self._nav_guard = True
+            if not self._confirm_discard_project_changes():
+                self._nav.setCurrentRow(projects_row)
+                self._nav_guard = False
+                return
+            self._nav_guard = False
         self._stack.setCurrentIndex(row)
+        self._update_footer_hint()
 
     def _wire_tab_order(self) -> None:
         """Keyboard navigation follows visual order; the sidebar is reachable."""
@@ -1941,8 +2295,9 @@ class SettingsDialog(QDialog):
         QWidget.setTabOrder(self._start_minimized_toggle, self._check_updates_toggle)
         QWidget.setTabOrder(self._check_updates_toggle, self._reset_position_btn)
         QWidget.setTabOrder(self._reset_position_btn, self._projects_list)
-        QWidget.setTabOrder(self._projects_list, self._project_context_edit)
-        QWidget.setTabOrder(self._project_context_edit, self._project_notes_edit)
+        QWidget.setTabOrder(self._projects_list, self._project_name_edit)
+        QWidget.setTabOrder(self._project_name_edit, self._project_conventions_edit)
+        QWidget.setTabOrder(self._project_conventions_edit, self._project_notes_edit)
 
     def _load_all(self) -> None:
         cfg = load_config()
@@ -2022,3 +2377,19 @@ class SettingsDialog(QDialog):
 
 
 SetupDialog = SettingsDialog
+
+
+def prepare_dialogs_for_application_quit(app: QApplication) -> None:
+    """End modal settings/history loops and allow windows to close during app quit."""
+    from history_ui import HistoryDialog
+
+    app.setProperty("opti_shutting_down", True)
+    for widget in app.allWidgets():
+        if isinstance(widget, SettingsDialog):
+            widget.prepare_for_application_quit()
+        elif isinstance(widget, HistoryDialog):
+            if hasattr(widget, "prepare_for_application_quit"):
+                widget.prepare_for_application_quit()
+    for widget in app.allWidgets():
+        if isinstance(widget, QDialog) and widget.isVisible():
+            widget.reject()
