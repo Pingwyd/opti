@@ -2,6 +2,25 @@
 
 All notable changes to Opti are documented here. Version numbers match `APP_VERSION` in `brand.py`.
 
+## [1.3.0] - 2026-10-17
+
+### Added
+
+- **Ask** transform mode (single-shot Q&A / explain).
+- **OpenAI** as a first-class provider (`api.openai.com`).
+- **Voice input** settings: recording mode, Whisper model size, toggle max duration; **Voice push-to-talk** shortcut on the Shortcuts pane.
+- Optional **GitHub release update check** (Settings → Startup).
+
+### Changed
+
+- Voice transcription shows model load progress and preloads the Whisper model when voice is enabled.
+- Per-provider API keys remain in `vault.json` (DPAPI); Settings key status updates immediately after save.
+
+### Fixed
+
+- Startup crash (`NameError: controller`) when registering global hotkeys and tray actions.
+- Voice transcription cancel honors worker interruption.
+
 ## [1.2.0] - 2026-09-15
 
 ### Added
@@ -31,5 +50,6 @@ All notable changes to Opti are documented here. Version numbers match `APP_VERS
 - Quit/shutdown path uses queued signals on the main thread.
 - Inject, API retry, and PyInstaller/CI installer build fixes from prior work on this branch.
 
+[1.3.0]: https://github.com/Pingwyd/opti/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/Pingwyd/opti/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Pingwyd/opti/compare/v1.0.0...v1.1.0
